@@ -1,0 +1,49 @@
+{
+  "name": "nas-lister dev",
+
+  "build": {
+    "dockerfile": "Dockerfile.dev"
+  },
+  "remoteUser": "devuser",
+  
+
+  // Monte le partage NAS depuis Ubuntu WSL
+  "mounts": [
+    "source=/mnt/horus/photos,target=/mnt/horus/photos,type=bind"
+  ],
+  // Variable d'environnement pour le chemin du NAS
+  "containerEnv": {
+    "NAS_MOUNT": "/mnt/horus/photos"
+  }, 
+  // Installation des outils de dev au build
+  "postCreateCommand": "pip install -r requirements.txt && pip install pylint black isort",
+  // Extensions VS Code dans le conteneur
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        // Python
+        "ms-python.python", // Support Python de base
+        "ms-python.pylint", // Linter
+        "ms-python.black-formatter", // Formatage automatique
+        "ms-python.isort", // Tri des imports
+        // Qualité de code
+        "streetsidesoftware.code-spell-checker", // Correction orthographique
+        "usernamehw.errorlens", // Affiche les erreurs inline
+        // Git
+        "eamodio.gitlens", // Git enrichi
+        // Utilitaires
+        "ms-azuretools.vscode-docker", // Support Docker
+        "mikestead.dotenv", // Support fichiers .env
+        "christian-kohler.path-intellisense", // Autocomplétion des chemins
+        // IA
+        "anthropic.claude-code" // Claude Code
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "ms-python.black-formatter",
+        "python.linting.enabled": true
+      }
+    }
+  }
+}

@@ -1,0 +1,2 @@
+# Aucune dépendance externe — uniquement la stdlib Python
+# Ajouter ici les futures dépendances si besoin

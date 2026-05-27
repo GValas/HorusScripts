@@ -1,0 +1,11 @@
+services:
+  nas-lister:
+    build: .
+    env_file: env/.env
+    volumes:
+      # NAS monté sur Ubuntu WSL, transmis au conteneur (lecture seule)
+      - ${NAS_MOUNT}:${NAS_MOUNT}:ro
+    # Pour une exécution ponctuelle (pas un service permanent)
+    # restart: "no"
+    # Pour un service qui tourne en boucle :
+    # restart: unless-stopped
