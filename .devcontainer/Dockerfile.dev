@@ -1,3 +1,18 @@
 FROM python:3.12-slim
+
+# Dépendances système
+# - ffmpeg : fournit les binaires ffmpeg ET ffprobe, requis par
+#   src/cine-videos/convert-h265.py et src/zzz/convert-perso-movies-to-mkv-h265.py
+#   (NB : convert-h265.py encode en hevc_nvenc / NVENC et nécessite donc en plus
+#    un GPU NVIDIA + drivers exposés au conteneur pour fonctionner à l'exécution).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dépendances Python des scripts src/zzz/ (non déclarées dans requirements.txt) :
+# - piexif  : lecture/écriture des dates EXIF des photos
+# - hachoir : extraction des métadonnées vidéo (fallback dans enrich-movies-photos-with-date.py)
+RUN pip install --no-cache-dir piexif hachoir
+
 RUN useradd -m -s /bin/bash devuser
 USER devuser

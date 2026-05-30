@@ -7,14 +7,33 @@
   "remoteUser": "devuser",
   
 
-  // Monte le partage NAS depuis Ubuntu WSL
+  // Monte les partages NAS depuis Ubuntu WSL.
+  // La source pointe sur /mnt/wsl/horus (propagation "shared", visible par la
+  // distro docker-desktop) et non sur /mnt/horus directement : les montages CIFS
+  // sous /mnt/horus sont en propagation "private" et n'apparaissent donc pas dans
+  // le conteneur. La cible reste /mnt/horus/* pour que NAS_MOUNT=/mnt/horus marche.
   "mounts": [
-    "source=/mnt/horus/photos,target=/mnt/horus/photos,type=bind"
+    "source=/mnt/wsl/horus/photos,target=/mnt/horus/photos,type=bind",
+    "source=/mnt/wsl/horus/movies,target=/mnt/horus/movies,type=bind",
+    "source=/mnt/wsl/horus/tvshows,target=/mnt/horus/tvshows,type=bind",
+    "source=/mnt/wsl/horus/cartoons,target=/mnt/horus/cartoons,type=bind"
   ],
+  // Accès au GPU NVIDIA (encodage NVENC de src/cine-videos/convert-h265.py).
+  // Sous WSL2, le NVIDIA Container Toolkit injecte le driver CUDA/NVENC du host
+  // Windows dans le conteneur. Prérequis HOST (non gérables ici) :
+  //   1. GPU NVIDIA + driver Windows récent avec support WSL ;
+  //   2. nvidia-container-toolkit installé/configuré dans le moteur Docker WSL2
+  //      (nvidia-ctk runtime configure --runtime=docker) ;
+  //   3. reconstruire le conteneur (« Dev Containers: Rebuild Container »).
+  "runArgs": ["--gpus", "all"],
   // Variable d'environnement pour le chemin du NAS
   "containerEnv": {
-    "NAS_MOUNT": "/mnt/horus/photos"
-  }, 
+    "NAS_MOUNT": "/mnt/horus",
+    // NVENC nécessite la capability « video », NON activée par défaut par le
+    // runtime NVIDIA (qui ne fournit que compute,utility). « all » l'inclut.
+    "NVIDIA_VISIBLE_DEVICES": "all",
+    "NVIDIA_DRIVER_CAPABILITIES": "all"
+  },
   // Installation des outils de dev au build
   "postCreateCommand": "pip install -r requirements.txt && pip install pylint black isort",
   // Extensions VS Code dans le conteneur
@@ -27,7 +46,7 @@
         "ms-python.black-formatter", // Formatage automatique
         "ms-python.isort", // Tri des imports
         // Qualité de code
-        "streetsidesoftware.code-spell-checker", // Correction orthographique
+        //"streetsidesoftware.code-spell-checker", // Correction orthographique
         "usernamehw.errorlens", // Affiche les erreurs inline
         // Git
         "eamodio.gitlens", // Git enrichi
