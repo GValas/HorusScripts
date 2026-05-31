@@ -1,19 +1,30 @@
 import os
 import subprocess
 import json
+from datetime import datetime
 from pathlib import Path
 
-# ── Configuration ────────────────────────────────────────────────────────────
+
+def log(msg: str = "") -> None:
+    """Affiche un message en préfixant chaque ligne d'un timestamp."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for line in str(msg).split("\n"):
+        print(f"{ts} | {line}")
+
+# ── Configuration (surchargeable par variables d'environnement en prod) ───────
+# INPUT_FOLDERS : liste séparée par des virgules
+#   ex: INPUT_FOLDERS="/mnt/horus/tvshows,/mnt/horus/movies,/mnt/horus/cartoons"
 INPUT_FOLDERS = [  # Root folders to scan recursively, one after another
-    r"/mnt/horus/tvshows",
-    # r"/mnt/horus/movies",
-    # r"/mnt/horus/cartoons",
+    p.strip()
+    for p in os.environ.get("INPUT_FOLDERS", "/mnt/horus/tvshows").split(",")
+    if p.strip()
 ]
-CQ = 26  # Quality (lower = better, 24–28 recommended)
-PRESET = "p4"  # p1 (fastest) → p7 (best quality)
+CQ = int(os.environ.get("CQ", "26"))  # Quality (lower = better, 24–28 recommended)
+PRESET = os.environ.get("PRESET", "p4")  # p1 (fastest) → p7 (best quality)
 EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov"}
 SKIP_SUFFIX = "_x265"  # Files already converted (skips them)
-DRY_RUN = False  # True = simulate only, no conversion / no file written
+# DRY_RUN : True = simulate only, no conversion / no file written
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes", "on")
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -53,7 +64,7 @@ def get_video_info(filepath: Path) -> dict:
         }
 
     except Exception as e:
-        print(f"  [!] ffprobe error on {filepath.name}: {e}")
+        log(f"  [!] ffprobe error on {filepath.name}: {e}")
         return {"codec": None, "audio_tracks": 0, "subtitle_tracks": 0}
 
 
@@ -62,20 +73,20 @@ def convert_to_x265(input_path: Path) -> bool:
     output_path = input_path.with_name(input_path.stem + "_x265.mkv")
 
     if output_path.exists():
-        print(f"  [~] Output already exists, skipping: {output_path.name}")
+        log(f"  [~] Output already exists, skipping: {output_path.name}")
         return True
 
     # Probe source streams
     info = get_video_info(input_path)
-    print(
+    log(
         f"  [i] Streams: video ({info['codec']}) | "
         f"{info['audio_tracks']} audio track(s) | "
         f"{info['subtitle_tracks']} subtitle track(s)"
     )
-    print(f"  [→] Converting: {input_path.name}")
+    log(f"  [→] Converting: {input_path.name}")
 
     if DRY_RUN:
-        print(f"  [DRY-RUN] Would convert to: {output_path.name}")
+        log(f"  [DRY-RUN] Would convert to: {output_path.name}")
         return True
 
     cmd = [
@@ -122,21 +133,24 @@ def convert_to_x265(input_path: Path) -> bool:
         new_mb = output_path.stat().st_size / 1024 / 1024
         saving = 100 - (new_mb / old_mb * 100)
 
-        print(f"  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB (saved {saving:.1f}%)")
+        log(
+            f"\033[92m  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB "
+            f"(saved {saving:.1f}%)\033[0m"
+        )
 
         if not audio_ok:
-            print(
+            log(
                 f"  [!] WARNING: audio tracks mismatch! "
                 f"expected {info['audio_tracks']}, got {out_info['audio_tracks']}"
             )
         if not sub_ok:
-            print(
+            log(
                 f"  [!] WARNING: subtitle tracks mismatch! "
                 f"expected {info['subtitle_tracks']}, got {out_info['subtitle_tracks']}"
             )
 
         if not (audio_ok and sub_ok):
-            print(
+            log(
                 f"  [✗] Stream count mismatch — kept for inspection: {output_path.name}"
             )
             return False
@@ -144,7 +158,7 @@ def convert_to_x265(input_path: Path) -> bool:
         # Success: replace the original with the converted file, keeping its name
         final_path = input_path.with_name(input_path.stem + ".mkv")
         if final_path.exists() and final_path != input_path:
-            print(
+            log(
                 f"  [!] WARNING: cannot rename, target already exists: {final_path.name} "
                 f"— kept both originals and {output_path.name}"
             )
@@ -152,12 +166,12 @@ def convert_to_x265(input_path: Path) -> bool:
 
         input_path.unlink()
         output_path.rename(final_path)
-        print(f"  [✓] Replaced original → {final_path.name}")
+        log(f"  [✓] Replaced original → {final_path.name}")
 
         return True
 
     except subprocess.CalledProcessError:
-        print(f"  [✗] FFmpeg error — deleting incomplete output")
+        log(f"  [✗] FFmpeg error — deleting incomplete output")
         if output_path.exists():
             output_path.unlink()
         return False
@@ -167,70 +181,70 @@ def scan_and_convert(root: str) -> tuple[int, int]:
     root_path = Path(root)
 
     if not root_path.exists():
-        print(f"[!] Folder not found: {root}")
+        log(f"[!] Folder not found: {root}")
         return 0, 0
 
-    print(f"[*] Scanning {root_path} recursively...\n")
+    log(f"[*] Scanning {root_path} recursively...\n")
     candidates = [
         f
         for f in root_path.rglob("*")
         if f.suffix.lower() in EXTENSIONS and SKIP_SUFFIX not in f.stem
     ]
 
-    print(f"[*] Found {len(candidates)} video files to check\n")
+    log(f"[*] Found {len(candidates)} video files to check\n")
 
     to_convert = []
     for f in candidates:
         info = get_video_info(f)
         codec = info["codec"]
         if codec is None:
-            print(f"  [?] Could not detect codec: {f.name}")
+            log(f"  [?] Could not detect codec: {f.name}")
         elif codec in ("hevc", "h265"):
-            print(f"  [=] Already x265, skipping: {f.relative_to(root_path)}")
+            log(f"  [=] Already x265, skipping: {f.relative_to(root_path)}")
         else:
-            print(f"  [!] Not x265 ({codec}): {f.relative_to(root_path)}")
+            log(f"  [!] Not x265 ({codec}): {f.relative_to(root_path)}")
             to_convert.append(f)
 
-    print(f"\n[*] {len(to_convert)} file(s) need conversion\n")
+    log(f"\n[*] {len(to_convert)} file(s) need conversion\n")
     if not to_convert:
-        print("[✓] Nothing to do!")
+        log("[✓] Nothing to do!")
         return 0, 0
 
     total_size_mb = sum(f.stat().st_size for f in to_convert) / 1024 / 1024
-    print(f"[*] Total size to convert: {total_size_mb:.1f} MB\n")
-    print("─" * 60)
+    log(f"[*] Total size to convert: {total_size_mb:.1f} MB\n")
+    log("─" * 60)
 
     success, failed = 0, 0
     for i, filepath in enumerate(to_convert, 1):
-        print(f"\n[{i}/{len(to_convert)}] {filepath.relative_to(root_path)}")
+        log(f"\n[{i}/{len(to_convert)}] {filepath.relative_to(root_path)}")
         if convert_to_x265(filepath):
             success += 1
         else:
             failed += 1
 
-    print("\n" + "─" * 60)
-    print(f"[✓] Converted successfully : {success}")
-    print(f"[✗] Failed                 : {failed}")
-    print(f"[*] Converted files saved alongside originals with '{SKIP_SUFFIX}' suffix")
+    log("\n" + "─" * 60)
+    log(f"[✓] Converted successfully : {success}")
+    log(f"[✗] Failed                 : {failed}")
+    log(f"[*] Converted files saved alongside originals with '{SKIP_SUFFIX}' suffix")
     return success, failed
 
 
 if __name__ == "__main__":
     if DRY_RUN:
-        print("[*] DRY-RUN mode: simulation only, no file will be converted\n")
+        log("[*] DRY-RUN mode: simulation only, no file will be converted\n")
 
     total_success, total_failed = 0, 0
     for folder in INPUT_FOLDERS:
-        print("\n" + "═" * 60)
-        print(f"[*] Folder: {folder}")
-        print("═" * 60 + "\n")
+        log("\n" + "═" * 60)
+        log(f"[*] Folder: {folder}")
+        log("═" * 60 + "\n")
         s, f = scan_and_convert(folder)
         total_success += s
         total_failed += f
 
     if len(INPUT_FOLDERS) > 1:
-        print("\n" + "═" * 60)
-        print(f"[*] GLOBAL TOTAL across {len(INPUT_FOLDERS)} folder(s)")
-        print(f"[✓] Converted successfully : {total_success}")
-        print(f"[✗] Failed                 : {total_failed}")
-        print("═" * 60)
+        log("\n" + "═" * 60)
+        log(f"[*] GLOBAL TOTAL across {len(INPUT_FOLDERS)} folder(s)")
+        log(f"[✓] Converted successfully : {total_success}")
+        log(f"[✗] Failed                 : {total_failed}")
+        log("═" * 60)

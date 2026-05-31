@@ -1,11 +1,22 @@
 services:
-  nas-lister:
-    build: .
+  convert-h265:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: horus-convert-h265
     env_file: env/.env
+    # Accès GPU NVIDIA pour NVENC (hevc_nvenc).
+    # Nécessite nvidia-container-toolkit installé et configuré sur l'hôte.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
     volumes:
-      # NAS monté sur Ubuntu WSL, transmis au conteneur (lecture seule)
-      - ${NAS_MOUNT}:${NAS_MOUNT}:ro
-    # Pour une exécution ponctuelle (pas un service permanent)
-    # restart: "no"
-    # Pour un service qui tourne en boucle :
-    # restart: unless-stopped
+      # NAS en LECTURE-ÉCRITURE : le script supprime les originaux et écrit les
+      # fichiers convertis. NE PAS mettre en lecture seule (:ro).
+      - ${NAS_MOUNT}:${NAS_MOUNT}
+    # Tâche ponctuelle, pas un service permanent
+    restart: "no"

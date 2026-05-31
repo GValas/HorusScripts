@@ -60,6 +60,10 @@ black src/ && isort src/ && pylint src/
 
 Copy `env/.env.example` to `env/.env` (gitignored) and set `NAS_MOUNT`. The same `.env` is consumed by both `docker compose` (volume + container env) and Linux scripts run locally. `NAS_HOST` / `NAS_SHARE` / `NAS_CREDENTIALS` are referenced only by the SMB-mount step.
 
-## Known doc/reality gaps
+## NAS mounting (WSL host — `/etc/`)
 
-The README references `./scripts/mount-nas.sh` for mounting the share, but **no `scripts/` directory exists yet** — the mount must currently be done manually (see README sections 3–5) or the script created.
+The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from `/etc/wsl.conf` (`[boot] command = /etc/mount-nas-horus.sh`). Both files live in `/etc/`, **not in this repo** (they are host/machine config, require `sudo` to edit). The script mounts the CIFS shares (`photos movies tvshows cartoons`) from `//192.168.1.182` using `~/.nas-credentials` (hardcoded — it does **not** read `env/.env`).
+
+Key trick: Docker Desktop runs in a separate WSL distro that only sees Ubuntu's FS via `/mnt/wsl` (propagation `shared`). A CIFS mount under `/mnt/horus` is `private` and stays invisible in containers, so the script mounts the real CIFS under `/mnt/wsl/horus/*` (Docker-visible, `--make-shared`) and bind-mirrors it to `/mnt/horus/*` for local runs (`NAS_MOUNT=/mnt/horus`). It is idempotent (guards each mount with `mountpoint -q`) and can be re-run by hand.
+
+The CIFS lines in `/etc/fstab` are neutralized (commented) because they mounted with `private` propagation under `/mnt/horus`, invisible to containers. Backups exist as `/etc/wsl.conf.bak` and `/etc/fstab.bak`. After editing `/etc/wsl.conf`, validate the boot trigger with `wsl --shutdown` (PowerShell) then relaunch Ubuntu.
