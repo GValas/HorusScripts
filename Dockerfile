@@ -8,9 +8,14 @@
 # (uniquement la stdlib + les binaires ffmpeg/ffprobe).
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 
+# tzdata : sans lui, le conteneur tourne en UTC et les logs sont décalés de 2h
+# par rapport à Paris (CEST). TZ ci-dessous fixe le fuseau utilisé par Python.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg python3 \
+    && apt-get install -y --no-install-recommends ffmpeg python3 tzdata \
     && rm -rf /var/lib/apt/lists/*
+
+# Fuseau horaire : aligne les timestamps des logs sur l'heure de Paris.
+ENV TZ=Europe/Paris
 
 WORKDIR /app
 COPY src/cine-videos/clean-names.py ./clean-names.py
