@@ -146,18 +146,31 @@ def detect_collisions(olds, news, logger):
 def apply_renames(olds, news, logger, dry_run: bool):
     renamed = skipped = errors = 0
     for old, new in zip(olds, news):
-        if old != new:
-            if dry_run:
-                logger.info("[DRY RUN]  %s\n           → %s", old, new)
+        if old == new:
+            continue
+
+        # Ne jamais écraser une cible déjà présente sur le disque : os.rename
+        # remplace silencieusement le fichier de destination sous POSIX.
+        # On tolère le simple changement de casse (même fichier sous-jacent sur
+        # un système insensible à la casse) via os.path.samefile.
+        if os.path.exists(new) and not os.path.samefile(old, new):
+            logger.warning(
+                "CIBLE EXISTE : '%s' existe déjà → '%s' non renommé", new, old
+            )
+            skipped += 1
+            continue
+
+        if dry_run:
+            logger.info("[DRY RUN]  %s\n           → %s", old, new)
+            renamed += 1
+        else:
+            try:
+                os.rename(old, new)
+                logger.info("OK   %s\n  →  %s", old, new)
                 renamed += 1
-            else:
-                try:
-                    os.rename(old, new)
-                    logger.info("OK   %s\n  →  %s", old, new)
-                    renamed += 1
-                except OSError as e:
-                    logger.error("ERREUR  %s  |  %s", old, e)
-                    errors += 1
+            except OSError as e:
+                logger.error("ERREUR  %s  |  %s", old, e)
+                errors += 1
     return renamed, skipped, errors
 
 
@@ -171,32 +184,47 @@ if __name__ == "__main__":
     logger.info("Roots  : %s", ROOTS)
     logger.info("=" * 64)
 
-    total_renamed = total_errors = 0
+    total_renamed = total_skipped = total_errors = 0
 
     # ── Dossiers ────────────────────────────────────────────
     logger.info("\n── Dossiers ──")
     olds = sorted(get_movies_dirs(ROOTS))
     news = clean_movies_dirs(olds)
     col = detect_collisions(olds, news, logger)
-    r, _, e = apply_renames(olds, news, logger, DRY_RUN)
+    r, sk, e = apply_renames(olds, news, logger, DRY_RUN)
     total_renamed += r
+    total_skipped += sk
     total_errors += e + col
-    logger.info("Dossiers : %d renommé(s), %d collision(s), %d erreur(s)", r, col, e)
+    logger.info(
+        "Dossiers : %d renommé(s), %d collision(s), %d ignoré(s) (cible existe), %d erreur(s)",
+        r,
+        col,
+        sk,
+        e,
+    )
 
     # ── Fichiers ────────────────────────────────────────────
     logger.info("\n── Fichiers ──")
     olds = sorted(get_movies_titles(ROOTS))
     news = clean_movies_titles(olds)
     col = detect_collisions(olds, news, logger)
-    r, _, e = apply_renames(olds, news, logger, DRY_RUN)
+    r, sk, e = apply_renames(olds, news, logger, DRY_RUN)
     total_renamed += r
+    total_skipped += sk
     total_errors += e + col
-    logger.info("Fichiers : %d renommé(s), %d collision(s), %d erreur(s)", r, col, e)
+    logger.info(
+        "Fichiers : %d renommé(s), %d collision(s), %d ignoré(s) (cible existe), %d erreur(s)",
+        r,
+        col,
+        sk,
+        e,
+    )
 
     # ── Bilan ────────────────────────────────────────────────
     logger.info("\n" + "=" * 64)
     logger.info("BILAN FINAL")
     logger.info("  Total renommés : %d", total_renamed)
+    logger.info("  Total ignorés  : %d  (cible déjà existante)", total_skipped)
     logger.info("  Total erreurs  : %d", total_errors)
     if DRY_RUN:
         logger.info("  → Mettez DRY_RUN = False pour appliquer les renommages.")
