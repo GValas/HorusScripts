@@ -10,8 +10,16 @@ from pathlib import Path
 
 ##################################################################
 
-ROOTS = ["/mnt/horus/tvshows", "/mnt/horus/movies", "/mnt/horus/cartoons"]
-DRY_RUN = True  # True = simulation sans renommage, False = renommage réel
+# Mêmes variables d'environnement que convert-h265.py (partagées via env/.env).
+# INPUT_FOLDERS : dossiers à parcourir, séparés par des virgules.
+ROOTS = [
+    p.strip()
+    for p in os.environ.get("INPUT_FOLDERS", "/mnt/horus/tvshows").split(",")
+    if p.strip()
+]
+# DRY_RUN : True = simulation sans renommage, False = renommage réel.
+# Défaut sûr (true) si non défini ; env/.env le force explicitement dans le container.
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("1", "true", "yes", "on")
 
 ##################################################################
 

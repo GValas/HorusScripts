@@ -13,9 +13,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY src/cine-videos/clean-names.py ./clean-names.py
 COPY src/cine-videos/convert-h265.py ./convert-h265.py
 
 # Logs en direct (docker compose logs -f), sans bufferisation
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python3", "convert-h265.py"]
+# On nettoie d'abord les noms (renommage), puis on convertit en HEVC.
+# Les deux scripts partagent INPUT_FOLDERS / DRY_RUN (via env/.env).
+CMD ["sh", "-c", "python3 clean-names.py && python3 convert-h265.py"]
