@@ -14,7 +14,7 @@ The codebase (comments, log messages, README) is written in **French**. Match th
 
 Scripts target the NAS in **two incompatible ways**, depending on where they are meant to run:
 
-- **Linux / container scripts** read the mount point from the `NAS_MOUNT` env var (default `/mnt/horus/photos`). Example: [src/script.py](src/script.py). These run inside the dev container or the prod container, where the host's SMB mount is bind-mounted in.
+- **Linux / container scripts** read the mount point from the `NAS_MOUNT` env var (`/mnt/wsl/horus`). Example: [src/script.py](src/script.py). These run inside the dev container or the prod container, where the host's SMB mount is bind-mounted in. **Use `/mnt/wsl/horus`, not `/mnt/horus`** — see the NAS-mounting section below for why a `/mnt/horus` bind makes the container see empty folders.
 - **Windows-host scripts** hardcode Windows UNC paths like `r"\\horus\movies"` in a `ROOT`/`ROOTS` constant at the top of the file. Example: [src/clean-movies-names.py](src/clean-movies-names.py) and everything in `src/zzz/`. These are meant to be run directly on a Windows machine against the NAS — they will **not** work in the Linux container as-is.
 
 When adding or modifying a script, decide which context it belongs to and follow that context's path convention. Don't assume `NAS_MOUNT` applies to the UNC-path scripts.
@@ -58,12 +58,14 @@ black src/ && isort src/ && pylint src/
 
 ## Configuration
 
-Copy `env/.env.example` to `env/.env` (gitignored) and set `NAS_MOUNT`. The same `.env` is consumed by both `docker compose` (volume + container env) and Linux scripts run locally. `NAS_HOST` / `NAS_SHARE` / `NAS_CREDENTIALS` are referenced only by the SMB-mount step.
+Copy `env/.env.example` to `env/.env` (gitignored) and set `NAS_MOUNT` (use `/mnt/wsl/horus` — see NAS-mounting section). The same `.env` is consumed by both `docker compose` (volume + container env) and Linux scripts run locally. `NAS_HOST` / `NAS_SHARE` / `NAS_CREDENTIALS` are referenced only by the SMB-mount step.
 
 ## NAS mounting (WSL host — `/etc/`)
 
 The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from `/etc/wsl.conf` (`[boot] command = /etc/mount-nas-horus.sh`). Both files live in `/etc/`, **not in this repo** (they are host/machine config, require `sudo` to edit). The script mounts the CIFS shares (`photos movies tvshows cartoons`) from `//192.168.1.182` using `~/.nas-credentials` (hardcoded — it does **not** read `env/.env`).
 
-Key trick: Docker Desktop runs in a separate WSL distro that only sees Ubuntu's FS via `/mnt/wsl` (propagation `shared`). A CIFS mount under `/mnt/horus` is `private` and stays invisible in containers, so the script mounts the real CIFS under `/mnt/wsl/horus/*` (Docker-visible, `--make-shared`) and bind-mirrors it to `/mnt/horus/*` for local runs (`NAS_MOUNT=/mnt/horus`). It is idempotent (guards each mount with `mountpoint -q`) and can be re-run by hand.
+Key trick: Docker Desktop runs in a separate WSL distro that only sees Ubuntu's FS via `/mnt/wsl` (propagation `shared`). A CIFS mount under `/mnt/horus` is invisible in containers, so the script mounts the real CIFS under `/mnt/wsl/horus/*` (Docker-visible, `--make-shared`) and bind-mirrors it to `/mnt/horus/*` for convenience. It is idempotent (guards each mount with `mountpoint -q`) and can be re-run by hand.
+
+**`NAS_MOUNT` must be `/mnt/wsl/horus`, never `/mnt/horus`.** `docker-compose.yml` bind-mounts `${NAS_MOUNT}:${NAS_MOUNT}` into the container. Docker Desktop only resolves host paths under `/mnt/wsl`; a bind on `/mnt/horus` captures the **empty ext4 mountpoint directory** (the CIFS submounts don't propagate to Docker's distro), so the container sees empty `movies/tvshows/...` folders. `/mnt/wsl/horus` is the shared CIFS mount Docker can actually see — and it also works for local (non-container) runs, so use it everywhere.
 
 The CIFS lines in `/etc/fstab` are neutralized (commented) because they mounted with `private` propagation under `/mnt/horus`, invisible to containers. Backups exist as `/etc/wsl.conf.bak` and `/etc/fstab.bak`. After editing `/etc/wsl.conf`, validate the boot trigger with `wsl --shutdown` (PowerShell) then relaunch Ubuntu.
