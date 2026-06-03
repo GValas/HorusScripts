@@ -10,7 +10,7 @@ from pathlib import Path
 
 ##################################################################
 
-# Mêmes variables d'environnement que convert-h265.py (partagées via env/.env).
+# Mêmes variables d'environnement que 02-convert-to-h265.py (partagées via env/.env).
 # INPUT_FOLDERS : dossiers à parcourir, séparés par des virgules.
 ROOTS = [
     p.strip()

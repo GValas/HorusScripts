@@ -6,11 +6,11 @@ SMB/CIFS : `movies`, `tvshows`, `cartoons`, `photos`, `perso`).
 Le conteneur de prod packagé ici enchaîne deux scripts sur les mêmes dossiers
 (`INPUT_FOLDERS`) :
 
-1. [`clean-names`](src/cine-videos/clean-names.py) — nettoie les noms de dossiers
+1. [`01-clean-names`](src/cine-videos/01-clean-names.py) — nettoie les noms de dossiers
    et de fichiers (retire les mentions techniques type `1080p`, `x264`…, normalise
    la casse et les séparateurs, met l'année entre parenthèses), avec détection de
    collisions.
-2. [`convert-h265`](src/cine-videos/convert-h265.py) — scanne récursivement les
+2. [`02-convert-to-h265`](src/cine-videos/02-convert-to-h265.py) — scanne récursivement les
    dossiers vidéo et ré-encode tout ce qui n'est pas déjà en HEVC vers x265 via
    **NVENC** (GPU NVIDIA), en conservant toutes les pistes audio/sous-titres, puis
    **remplace l'original** par le fichier converti après vérification du nombre de
@@ -116,14 +116,14 @@ plutôt que `/etc/fstab` : un montage CIFS via `fstab` se fait en propagation
 3. Lancer le script depuis le terminal intégré :
 
 ```bash
-python src/cine-videos/convert-h265.py
+python src/cine-videos/02-convert-to-h265.py
 ```
 
 ---
 
 ## Prod — lancer le pipeline dans le conteneur
 
-Le conteneur lance `clean-names` (renommage) **puis** `convert-h265`
+Le conteneur lance `01-clean-names` (renommage) **puis** `convert-h265`
 (ré-encodage). Ce dernier utilise **NVENC** (`hevc_nvenc`) : le conteneur a donc
 besoin d'accéder au **GPU NVIDIA** de l'hôte, et le NAS doit être monté en
 **lecture-écriture** (les scripts renomment, suppriment l'original et écrivent le
@@ -191,8 +191,8 @@ Astuce : créer un alias shell pour éviter de retaper `--env-file env/.env`.
 
 Tous les réglages de prod vivent dans `env/.env` (template : `env/.env.example`).
 Ils surchargent le bloc de configuration en tête de
-[`clean-names.py`](src/cine-videos/clean-names.py) et
-[`convert-h265.py`](src/cine-videos/convert-h265.py) ; en l'absence de variable,
+[`01-clean-names.py`](src/cine-videos/01-clean-names.py) et
+[`02-convert-to-h265.py`](src/cine-videos/02-convert-to-h265.py) ; en l'absence de variable,
 les valeurs par défaut des scripts s'appliquent.
 
 | Variable | Défaut | Portée | Description |
@@ -212,8 +212,8 @@ Les chemins de `INPUT_FOLDERS` doivent se trouver **sous** `NAS_MOUNT`.
 HorusScripts/
 ├── src/
 │   ├── cine-videos/
-│   │   ├── clean-names.py         # Renommage (tourne avant la conversion)
-│   │   └── convert-h265.py        # Ré-encodage NVENC HEVC
+│   │   ├── 01-clean-names.py      # Renommage (tourne avant la conversion)
+│   │   └── 02-convert-to-h265.py  # Ré-encodage NVENC HEVC
 │   └── perso-photo-videos/        # Scripts photos/vidéos perso (hôte Windows)
 ├── env/
 │   ├── .env                       # Local — gitignored

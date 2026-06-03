@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     image: horus-convert-h265
     env_file: env/.env
+    environment:
+      # Surcharge le DRY_RUN d'env/.env par celui exporté par run-convert-h265.sh
+      # (le shell est prioritaire sur env/.env pour l'interpolation ${...}).
+      DRY_RUN: ${DRY_RUN:-false}
     # Accès GPU NVIDIA pour NVENC (hevc_nvenc).
     # Nécessite nvidia-container-toolkit installé et configuré sur l'hôte.
     deploy:
@@ -18,5 +22,42 @@ services:
       # NAS en LECTURE-ÉCRITURE : le script supprime les originaux et écrit les
       # fichiers convertis. NE PAS mettre en lecture seule (:ro).
       - ${NAS_MOUNT}:${NAS_MOUNT}
+    # On nettoie d'abord les noms (renommage), puis on convertit en HEVC.
+    # Les deux scripts partagent INPUT_FOLDERS / DRY_RUN (via env/.env).
+    command: ["sh", "-c", "python3 01-clean-names.py && python3 02-convert-to-h265.py"]
+    # Tâche ponctuelle, pas un service permanent
+    restart: "no"
+
+  # Compression photos/vidéos perso -> ./output/gphotos (un sous-dossier =
+  # un futur album Google Photos). Vidéos ré-encodées en H.265 via NVENC.
+  # Lancement ciblé : docker compose --env-file env/.env run --rm compress-gphotos
+  compress-gphotos:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: horus-convert-h265 # même image que convert-h265
+    env_file: env/.env
+    environment:
+      # NAS_MOUNT=/mnt/wsl/horus en prod : les photos sont là, PAS sous
+      # /mnt/horus (chemin propre au devcontainer). On force donc la source.
+      PHOTOS_SOURCE: ${NAS_MOUNT}/photos
+      # Sortie écrite dans le volume monté ci-dessous (persistée sur l'hôte).
+      OUTPUT_FOLDER: /output/gphotos
+      # DRY_RUN piloté par run-compress-gphotos.sh (défaut sûr : true).
+      DRY_RUN: ${DRY_RUN:-true}
+    # Accès GPU NVIDIA pour NVENC (hevc_nvenc).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+    volumes:
+      # NAS en LECTURE SEULE : la compression ne fait que lire le share.
+      - ${NAS_MOUNT}:${NAS_MOUNT}:ro
+      # Dossier de sortie persisté sur l'hôte (à côté du projet).
+      - ./output:/output
+    command: ["python3", "02-compress-for-gphotos.py"]
     # Tâche ponctuelle, pas un service permanent
     restart: "no"

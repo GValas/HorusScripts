@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-any_to_mkv_h265.py — Convertit les vidéos à codecs legacy en MKV (H.265 / HEVC)
+any_to_mkv_h265.py — Met TOUTES les vidéos en MKV
 - Recherche récursive et insensible à la casse
-- Détecte le codec via ffprobe : ignore les fichiers déjà en H.264/H.265
+- Détecte le codec via ffprobe et choisit l'action :
+    • codec legacy            → ré-encodage H.265 / HEVC (avec perte, lent)
+    • codec récent, non-MKV   → remux -c copy vers MKV (sans perte, quasi instantané)
+    • déjà en .mkv            → ignoré (rien à faire)
 - Écrit le fichier converti au même endroit que l'original
+- N'écrase jamais une cible .mkv déjà existante
+- Préserve la date d'origine : le tag creation_time est recopié dans le MKV
+  (à défaut, la date de modification du fichier), et la mtime du fichier de
+  sortie est réalignée sur celle de l'original
 - Supprime l'original si la conversion réussit
 - Bilan final par extension et par codec
 Prérequis : ffmpeg + ffprobe installés et accessibles dans le PATH
 """
 
+import os
 import subprocess
 import sys
 import logging
@@ -21,7 +29,10 @@ SOURCE_DIR    = Path(r"\\horus\photos")  # ← à modifier
 
 DRY_RUN       = False    # True = simulation sans conversion, False = conversion réelle
 
-EXTENSIONS    = {".mov", ".wmv", ".mpeg", ".mpg", ".rm", ".rmvb",
+# Conteneurs candidats : tout sauf .mkv (la cible). Les .mp4/.webp récents
+# seront simplement remuxés en .mkv (sans ré-encodage) ; les codecs legacy
+# (quel que soit le conteneur) seront ré-encodés en H.265.
+EXTENSIONS    = {".mov", ".mp4", ".webm", ".wmv", ".mpeg", ".mpg", ".rm", ".rmvb",
                  ".3gp", ".avi", ".divx", ".asf", ".vob",
                  ".m2ts", ".mts", ".flv", ".f4v", ".m4v"}
 
@@ -41,6 +52,9 @@ LEGACY_CODECS = {
 }
 
 OUTPUT_SUFFIX = ".mkv"
+# Année plancher : un tag creation_time antérieur (epoch 1904/1970) est ignoré
+# lors du calcul de la date d'origine à préserver.
+MIN_PLAUSIBLE_YEAR = 1990
 CRF           = 28       # Qualité H.265 : 0 (max) → 51 (min), 28 = bon équilibre
 PRESET        = "medium" # ultrafast / fast / medium / slow / veryslow
 AUDIO_CODEC   = "aac"
@@ -85,22 +99,95 @@ def get_video_codec(path: Path) -> str | None:
     return result.stdout.strip() or None
 
 
-def convert(input_path: Path, output_path: Path, logger: logging.Logger) -> bool:
+def get_creation_time(path: Path) -> str | None:
+    """Lit le tag creation_time exposé par ffprobe (tags de format) ; None si absent."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format_tags=creation_time",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.stdout.strip() or None
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """Parse une date ffprobe (ISO 8601, éventuellement avec 'T', 'Z' ou fraction)."""
+    core = value.strip().replace("T", " ").split(".")[0].strip()
+    if core.endswith("Z"):
+        core = core[:-1].strip()
+    if len(core) >= 6 and core[-6] in "+-" and core[-3] == ":":   # suffixe ±hh:mm
+        core = core[:-6].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(core, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def source_creation_iso(path: Path) -> str:
+    """Date d'origine à incruster dans le MKV (ISO 8601).
+
+    Prend la PLUS ANCIENNE entre le tag creation_time du fichier et sa date de
+    modification (mtime) — la plus proche de la prise de vue réelle. Un tag
+    creation_time aberrant (epoch, année < 1990) est écarté.
+    """
+    candidates = [datetime.fromtimestamp(path.stat().st_mtime)]
+    embedded = get_creation_time(path)
+    if embedded:
+        dt = _parse_iso(embedded)
+        if dt and dt.year >= MIN_PLAUSIBLE_YEAR:
+            candidates.append(dt)
+    return min(candidates).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def encode_h265(input_path: Path, output_path: Path,
+                creation_iso: str, logger: logging.Logger) -> bool:
+    """Ré-encode la vidéo en H.265 (avec perte) — pour les codecs legacy."""
     cmd = [
         "ffmpeg",
         "-i",      str(input_path),
+        "-map_metadata", "0",        # recopie les métadonnées globales (dont creation_time)
         "-c:v",    "libx265",
         "-crf",    str(CRF),
         "-preset", PRESET,
         "-tag:v",  "hvc1",       # compatibilité Apple
         "-c:a",    AUDIO_CODEC,
         "-b:a",    AUDIO_BITRATE,
+        "-metadata", f"creation_time={creation_iso}",  # garantit la date d'origine
         "-y",
         str(output_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error("Erreur ffmpeg :\n%s", result.stderr[-800:])
+        return False
+    return True
+
+
+def remux_to_mkv(input_path: Path, output_path: Path,
+                 creation_iso: str, logger: logging.Logger) -> bool:
+    """Change seulement le conteneur vers MKV (-c copy) — sans ré-encodage, sans perte.
+
+    Tous les flux (vidéo/audio/sous-titres) sont recopiés tels quels, ainsi que
+    les métadonnées globales (creation_time réinjecté pour garantir la date
+    d'origine). Si un codec de sous-titres est incompatible avec le MKV, ffmpeg
+    échoue : on conserve alors l'original (voir gestion de l'échec dans main()).
+    """
+    cmd = [
+        "ffmpeg",
+        "-i",   str(input_path),
+        "-map", "0",
+        "-c",   "copy",
+        "-map_metadata", "0",        # recopie les métadonnées globales (dont creation_time)
+        "-metadata", f"creation_time={creation_iso}",  # garantit la date d'origine
+        "-y",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error("Erreur ffmpeg (remux) :\n%s", result.stderr[-800:])
         return False
     return True
 
@@ -173,14 +260,15 @@ def main():
     codec_stats = defaultdict(lambda: {"count": 0, "size": 0, "converted": 0})
 
     total_size = 0
-    skipped = ok = errors = 0
+    skipped = encoded = remuxed = errors = 0
     start_total = datetime.now()
 
     for i, input_file in enumerate(candidates, 1):
         relative    = input_file.relative_to(SOURCE_DIR)
         output_file = input_file.with_suffix(OUTPUT_SUFFIX)
         ext         = input_file.suffix.lower()
-        size        = input_file.stat().st_size
+        src_stat    = input_file.stat()
+        size        = src_stat.st_size
 
         codec = get_video_codec(input_file)
         codec_label = codec or "inconnu"
@@ -194,35 +282,72 @@ def main():
         codec_stats[codec_label]["count"] += 1
         codec_stats[codec_label]["size"]  += size
 
-        if codec and codec not in LEGACY_CODECS:
-            logger.info("    → ignoré (codec récent)")
+        # Choix de l'action : codec legacy (ou indéterminé) → ré-encodage H.265 ;
+        # codec récent → simple remux vers MKV (sans perte). Aucun fichier n'est
+        # « ignoré » : tout doit finir en MKV (les .mkv ne sont même pas scannés).
+        legacy = (codec is None) or (codec in LEGACY_CODECS)
+        action = "encode" if legacy else "remux"
+
+        # Ne jamais écraser une cible .mkv déjà existante (cf. clean-names).
+        if output_file.exists():
+            logger.warning("    → ignoré : la cible existe déjà — %s", output_file.name)
             skipped += 1
             continue
 
         total_size += size
 
+        # Date d'origine à préserver dans le MKV (tag creation_time, sinon mtime).
+        creation_iso = source_creation_iso(input_file)
+
         if DRY_RUN:
-            logger.info("    → serait converti en : %s", output_file.name)
+            if action == "encode":
+                logger.info("    → serait RÉ-ENCODÉ (H.265) en : %s", output_file.name)
+            else:
+                logger.info("    → serait REMUXÉ (-c copy) en : %s", output_file.name)
+            logger.info("    → date préservée (creation_time) : %s", creation_iso)
             logger.info("    → original serait supprimé après conversion")
             ext_stats[ext]["converted"]           += 1
             codec_stats[codec_label]["converted"] += 1
-            ok += 1
+            if action == "encode":
+                encoded += 1
+            else:
+                remuxed += 1
             continue
 
         t0 = datetime.now()
-        success = convert(input_file, output_file, logger)
+        if action == "encode":
+            success = encode_h265(input_file, output_file, creation_iso, logger)
+        else:
+            success = remux_to_mkv(input_file, output_file, creation_iso, logger)
         elapsed = (datetime.now() - t0).seconds
 
         if success:
+            # Réaligne la date de modification du MKV sur celle de l'original
+            # (le tag creation_time, lui, est déjà incrusté par ffmpeg).
+            try:
+                os.utime(output_file, (src_stat.st_atime, src_stat.st_mtime))
+            except OSError as e:
+                logger.warning("    ⚠️  mtime non restaurée : %s", e)
+
+            # Vérifie que la date est bien présente dans le MKV produit.
+            written = get_creation_time(output_file)
+            if not written:
+                logger.warning("    ⚠️  creation_time absent du MKV produit")
+
+            verb = "RÉ-ENCODÉ" if action == "encode" else "REMUXÉ"
             logger.info(
-                "    ✓ OK  →  %s (%s)  [%ds]",
-                output_file.name, human_size(output_file), elapsed
+                "    ✓ %s  →  %s (%s)  [%ds]  date=%s",
+                verb, output_file.name, human_size(output_file), elapsed,
+                written or creation_iso,
             )
             input_file.unlink()
             logger.info("    🗑  Original supprimé : %s", input_file.name)
             ext_stats[ext]["converted"]           += 1
             codec_stats[codec_label]["converted"] += 1
-            ok += 1
+            if action == "encode":
+                encoded += 1
+            else:
+                remuxed += 1
         else:
             logger.error("    ✗ ÉCHEC  →  %s (original conservé)", input_file.name)
             if output_file.exists():
@@ -236,9 +361,11 @@ def main():
     logger.info("")
     logger.info("=" * 56)
     logger.info("BILAN GÉNÉRAL")
-    logger.info("  Fichiers analysés  : %d", len(candidates))
-    logger.info("  Ignorés (récents)  : %d", skipped)
-    logger.info("  Taille à convertir : %s", human_size_bytes(total_size))
+    logger.info("  Fichiers analysés     : %d", len(candidates))
+    logger.info("  À ré-encoder (H.265)  : %d", encoded)
+    logger.info("  À remuxer (-c copy)   : %d", remuxed)
+    logger.info("  Ignorés (cible exist.): %d", skipped)
+    logger.info("  Taille à convertir    : %s", human_size_bytes(total_size))
     logger.info("")
 
     print_bilan(logger, "Par extension", ext_stats, label_width=8)
@@ -247,10 +374,16 @@ def main():
     logger.info("")
 
     if DRY_RUN:
-        logger.info("  Dry run terminé  —  %d fichier(s) seraient convertis", ok)
+        logger.info(
+            "  Dry run terminé  —  %d ré-encodage(s) + %d remux = %d fichier(s)",
+            encoded, remuxed, encoded + remuxed,
+        )
         logger.info("  Mettez DRY_RUN = False pour lancer la conversion.")
     else:
-        logger.info("  Terminé en %ds  —  %d converti(s), %d erreur(s)", elapsed_total, ok, errors)
+        logger.info(
+            "  Terminé en %ds  —  %d ré-encodé(s), %d remuxé(s), %d erreur(s)",
+            elapsed_total, encoded, remuxed, errors,
+        )
         logger.info("  Log : %s", SOURCE_DIR / "conversion.log")
     logger.info("=" * 56)
 

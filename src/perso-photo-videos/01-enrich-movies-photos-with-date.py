@@ -3,39 +3,67 @@
 scan_media_dates.py
 --------------------
 Scanne récursivement un répertoire, détecte les tags de date manquants,
-et les corrige automatiquement (photos JPEG via piexif, vidéos en natif ISO BMFF/RIFF).
+et les corrige automatiquement :
+  - photos JPEG : tags EXIF via piexif (DateTimeOriginal, lu par Google Photos)
+  - vidéos MKV  : tag creation_time via ffmpeg/ffprobe (lu par Google Photos)
+
+Côté vidéo, seul le conteneur MKV est traité : le pipeline amont
+(00-convert-to-mkv+h265.py) garantit que toutes les vidéos sont déjà en .mkv.
 
 Stratégie de date de remplacement (par ordre de priorité) :
   1. Un autre tag de date présent dans le même fichier
   2. La date d'une photo du même dossier qui possède déjà un tag valide
   3. Abandon (fichier signalé comme non corrigeable)
 
+Les vidéos sont écrites en remux (`-c copy`, sans réencodage) : ffmpeg produit
+un MKV valide, la date relue est vérifiée, et l'original n'est remplacé
+qu'en cas de succès.
+
+Le script tourne dans le même contexte que 02-compress-for-gphotos.py
+(dev/prod container ou local), contre le share monté du NAS.
+
 Dépendances:
-    pip install piexif hachoir
+    pip install piexif
+    ffmpeg + ffprobe disponibles sur le PATH
 """
 
 import os
 import sys
 import csv
 import json
-import struct
 import shutil
+import logging
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
 import piexif
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION — modifiez ces variables selon vos besoins
+# CONFIGURATION (surchargeable par variables d'environnement)
 # ══════════════════════════════════════════════════════════════════════════════
 
-REPERTOIRE   = r"\\horus\photos"   # Répertoire racine à scanner
-EXPORT_CSV   = r"rapport.csv"      # Chemin du rapport CSV  (None pour désactiver)
-EXPORT_JSON  = None                # Chemin du rapport JSON (None pour désactiver)
 
-DRY_RUN      = True                # True = simulation, aucun fichier modifié
-FIX_PHOTOS   = True                # Corriger les photos JPEG
-FIX_VIDEOS   = True                # Corriger les vidéos
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+
+
+# Répertoire racine à scanner : le share photos du NAS (même var que
+# 02-compress-for-gphotos.py pour partager la configuration).
+SOURCE       = os.environ.get("PHOTOS_SOURCE", "/mnt/horus/photos")
+
+# Rapports : chemin vide ("") ou "none" pour désactiver.
+EXPORT_CSV   = os.environ.get("EXPORT_CSV", "rapport.csv")
+EXPORT_JSON  = os.environ.get("EXPORT_JSON", "")
+if EXPORT_CSV.lower() in ("", "none"):
+    EXPORT_CSV = None
+if EXPORT_JSON.lower() in ("", "none"):
+    EXPORT_JSON = None
+
+# DRY_RUN : True = simulation, aucun fichier modifié. Défaut sûr.
+DRY_RUN      = _env_bool("DRY_RUN", "true")
+FIX_PHOTOS   = _env_bool("FIX_PHOTOS", "true")   # Corriger les photos JPEG
+FIX_VIDEOS   = _env_bool("FIX_VIDEOS", "true")   # Corriger les vidéos
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -43,17 +71,78 @@ NULL_DATE = b"0000:00:00 00:00:00"
 
 PHOTO_EXTENSIONS = {".jpg", ".jpeg"}
 
-VIDEO_EXTENSIONS = {
-    ".mp4", ".mov", ".avi", ".mkv", ".3gp", ".m4v",
-    ".wmv", ".flv", ".webm", ".mts", ".m2ts",
+# Vidéos : uniquement le MKV (le pipeline amont normalise tout en .mkv).
+VIDEO_EXTENSIONS = {".mkv"}
+
+# Clés de tags de date reconnues dans la sortie ffprobe (insensible à la casse).
+# Tags pertinents pour le conteneur MKV (Matroska) : creation_time injecté par
+# ffmpeg, et les champs natifs date / date_recorded.
+DATE_TAG_KEYS = {
+    "creation_time",
+    "date",
+    "date_recorded",
 }
+
+# Bornes de plausibilité : rejette les dates epoch (1970 Unix, et 1904 hérité
+# d'anciens conteneurs) que certains encodeurs écrivent au lieu d'une vraie date.
+MIN_PLAUSIBLE_YEAR = 1990
+MAX_PLAUSIBLE_YEAR = 2100
 
 # Cache : pour chaque dossier, la première date valide trouvée dans le dossier
 _folder_date_cache: dict[Path, bytes | None] = {}
 
 
+def setup_logging() -> logging.Logger:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    return logging.getLogger(__name__)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# LECTURE DES TAGS
+# UTILITAIRES DE DATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _is_plausible_date(dt: datetime) -> bool:
+    """Écarte les dates epoch (1904/1970) et les valeurs aberrantes."""
+    return MIN_PLAUSIBLE_YEAR <= dt.year <= MAX_PLAUSIBLE_YEAR
+
+
+def _parse_any_date(value) -> datetime | None:
+    """
+    Parse une date dans les formats courants (EXIF, ISO 8601, sortie ffprobe)
+    en datetime naïf. Tolère 'T', fraction de seconde et suffixe de fuseau.
+    Retourne None si aucun format ne correspond.
+    """
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # Normalise : 'T' -> espace, retire la fraction de seconde
+    core = s.replace("T", " ").split(".")[0].strip()
+    # Retire un suffixe de fuseau éventuel ('Z' ou '±hh:mm')
+    if core.endswith("Z"):
+        core = core[:-1].strip()
+    if len(core) >= 6 and core[-6] in "+-" and core[-3] == ":":
+        core = core[:-6].strip()
+
+    for candidate in (core, core[:19]):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y:%m:%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y:%m:%d"):
+            try:
+                return datetime.strptime(candidate, fmt)
+            except ValueError:
+                continue
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LECTURE DES TAGS — PHOTOS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def check_photo_tags(filepath: Path) -> dict:
@@ -98,6 +187,48 @@ def check_photo_tags(filepath: Path) -> dict:
     return result
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# LECTURE DES TAGS — VIDÉOS (ffprobe)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ffprobe_date(filepath: Path) -> datetime | None:
+    """
+    Lit la première date de création plausible exposée par ffprobe
+    (tags format + tags de chaque flux). Retourne un datetime ou None.
+    Lève FileNotFoundError si ffprobe n'est pas sur le PATH.
+    """
+    proc = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", str(filepath),
+        ],
+        capture_output=True, text=True, timeout=120,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    tag_dicts = []
+    fmt = data.get("format") or {}
+    if isinstance(fmt.get("tags"), dict):
+        tag_dicts.append(fmt["tags"])
+    for stream in data.get("streams") or []:
+        if isinstance(stream.get("tags"), dict):
+            tag_dicts.append(stream["tags"])
+
+    for tags in tag_dicts:
+        for key, val in tags.items():
+            if key.lower() in DATE_TAG_KEYS:
+                dt = _parse_any_date(val)
+                if dt and _is_plausible_date(dt):
+                    return dt
+    return None
+
+
 def check_video_tags(filepath: Path) -> dict:
     result = {
         "type": "video",
@@ -109,170 +240,25 @@ def check_video_tags(filepath: Path) -> dict:
     }
 
     try:
-        from hachoir.parser import createParser
-        from hachoir.metadata import extractMetadata
-        parser = createParser(str(filepath))
-        if parser:
-            with parser:
-                metadata = extractMetadata(parser)
-            if metadata:
-                date_val = None
-                if metadata.has("creation_date"):
-                    date_val = str(metadata.get("creation_date"))
-                elif metadata.has("last_modification"):
-                    date_val = str(metadata.get("last_modification"))
-                if date_val:
-                    result["tags_found"].append({"tag": "creation_date", "value": date_val})
-                    result["primary_date"] = date_val
-                    result["has_critical_tag"] = True
-                else:
-                    result["tags_missing"].append({"tag": "creation_date"})
-                return result
-    except ImportError:
-        pass
-    except Exception as e:
-        result["error"] = f"hachoir: {e}"
-
-    # Lecture ICRD sur AVI (RIFF natif, sans dépendance)
-    if filepath.suffix.lower() == ".avi":
-        try:
-            date_val = _read_avi_icrd(filepath)
-            if date_val:
-                result["tags_found"].append({"tag": "ICRD (RIFF INFO)", "value": date_val})
-                result["primary_date"] = date_val
-                result["has_critical_tag"] = True
-            else:
-                result["tags_missing"].append({"tag": "ICRD (RIFF INFO)"})
-        except Exception as e:
-            if not result["error"]:
-                result["error"] = str(e)
-            result["tags_missing"].append({"tag": "ICRD (RIFF INFO)"})
+        dt = _ffprobe_date(filepath)
+    except FileNotFoundError:
+        result["error"] = "ffprobe introuvable sur le PATH"
+        result["tags_missing"].append({"tag": "creation_time"})
+        return result
+    except (subprocess.SubprocessError, OSError) as e:
+        result["error"] = f"ffprobe: {e}"
+        result["tags_missing"].append({"tag": "creation_time"})
         return result
 
-    # Lecture atome mvhd (MP4/MOV)
-    try:
-        date_val = _read_mp4_creation_date(filepath)
-        if date_val:
-            result["tags_found"].append({"tag": "creation_time (mvhd)", "value": date_val})
-            result["primary_date"] = date_val
-            result["has_critical_tag"] = True
-        else:
-            result["tags_missing"].append({"tag": "creation_time"})
-    except Exception as e:
-        if not result["error"]:
-            result["error"] = str(e)
+    if dt:
+        date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        result["tags_found"].append({"tag": "creation_time", "value": date_str})
+        result["primary_date"] = date_str
+        result["has_critical_tag"] = True
+    else:
         result["tags_missing"].append({"tag": "creation_time"})
 
     return result
-
-
-# ── Utilitaires MP4/MOV (ISO BMFF) natifs ────────────────────────────────────
-
-MAC_EPOCH_OFFSET = 2082844800  # secondes entre 1904-01-01 et 1970-01-01
-
-def _find_mp4_box(data: bytes, target: bytes, start: int = 0, end: int = None):
-    """
-    Recherche récursive d'un atome ISO BMFF / QuickTime. Retourne (offset, size) ou None.
-    Gère : size=0 (jusqu'à EOF), size=1 (64-bit largesize), wide boxes (padding QuickTime).
-    """
-    if end is None:
-        end = len(data)
-    offset = start
-    while offset + 8 <= end:
-        raw_size = struct.unpack(">I", data[offset:offset+4])[0]
-        box_type = data[offset+4:offset+8]
-
-        # size=0 : l'atome s'étend jusqu'à la fin du container
-        if raw_size == 0:
-            box_size = end - offset
-        # size=1 : taille réelle encodée sur 8 octets après le type (largesize)
-        elif raw_size == 1:
-            if offset + 16 > end:
-                break
-            box_size    = struct.unpack(">Q", data[offset+8:offset+16])[0]
-            inner_start = offset + 16   # payload commence après largesize
-        else:
-            box_size    = raw_size
-            inner_start = offset + 8
-
-        if box_size < 8:
-            break
-
-        # wide box (8 octets, padding QuickTime avant mdat/moov) : ignorer
-        if box_type == b"wide":
-            offset += box_size
-            continue
-
-        if box_type == target:
-            return offset, box_size
-
-        # Descendre dans les containers
-        if box_type in (b"moov", b"trak", b"mdia", b"minf", b"stbl", b"udta"):
-            result = _find_mp4_box(data, target, inner_start, offset + box_size)
-            if result:
-                return result
-
-        offset += box_size
-    return None
-
-
-def _parse_date_str(date_str: str) -> datetime:
-    """Parse une date dans les formats courants EXIF/ISO."""
-    for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            return datetime.strptime(date_str[:19], fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"Format de date non reconnu: {date_str!r}")
-
-
-def _read_mp4_creation_date(filepath: Path) -> str | None:
-    """Lit la date de création depuis l'atome mvhd d'un MP4/MOV."""
-    try:
-        with open(filepath, "rb") as f:
-            data = f.read(min(8 * 1024 * 1024, os.path.getsize(filepath)))
-        result = _find_mp4_box(data, b"mvhd")
-        if not result:
-            return None
-        off, size = result
-        payload = data[off+8:off+size]
-        version = payload[0]
-        creation_time = struct.unpack(">I", payload[4:8])[0] if version == 0                         else struct.unpack(">Q", payload[4:12])[0]
-        if creation_time > 0:
-            unix_ts = creation_time - MAC_EPOCH_OFFSET
-            if 0 < unix_ts < 4_102_444_800:
-                return datetime.fromtimestamp(unix_ts).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        pass
-    return None
-
-
-def _write_mp4_creation_date(filepath: Path, date_str: str) -> None:
-    """
-    Écrit la date directement dans l'atome mvhd d'un MP4/MOV, in-place.
-    Modifie creation_time ET modification_time.
-    Gère les atomes 64-bit (largesize) : le payload mvhd commence à off+16 au lieu de off+8.
-    """
-    with open(filepath, "r+b") as f:
-        data = bytearray(f.read())
-    result = _find_mp4_box(bytes(data), b"mvhd")
-    if not result:
-        raise ValueError("Atome mvhd introuvable dans le fichier")
-    off, _ = result
-    # Déterminer où commence le payload (après size+type, ou après size+type+largesize)
-    raw_size    = struct.unpack(">I", data[off:off+4])[0]
-    payload_off = off + 16 if raw_size == 1 else off + 8
-    version     = data[payload_off]
-    dt          = _parse_date_str(date_str)
-    mac_ts      = int(dt.timestamp()) + MAC_EPOCH_OFFSET
-    if version == 0:
-        struct.pack_into(">I", data, payload_off + 4, mac_ts)   # creation_time
-        struct.pack_into(">I", data, payload_off + 8, mac_ts)   # modification_time
-    else:
-        struct.pack_into(">Q", data, payload_off + 4,  mac_ts)
-        struct.pack_into(">Q", data, payload_off + 12, mac_ts)
-    with open(filepath, "wb") as f:
-        f.write(data)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -336,7 +322,7 @@ def resolve_date(filepath: Path, info: dict) -> tuple[bytes | None, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CORRECTION DES FICHIERS
+# CORRECTION DES FICHIERS — PHOTOS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fix_photo(filepath: Path, info: dict, date: bytes, dry_run: bool) -> str:
@@ -374,159 +360,74 @@ def fix_photo(filepath: Path, info: dict, date: bytes, dry_run: bool) -> str:
         return f"erreur écriture: {e}"
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CORRECTION DES FICHIERS — VIDÉOS (ffmpeg, remux sans réencodage)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _read_avi_icrd(filepath: Path) -> str | None:
-    """Lit le chunk ICRD (date de création) dans un fichier AVI (format RIFF)."""
+def _ffmpeg_set_creation_time(filepath: Path, dt: datetime) -> None:
+    """
+    Réécrit la vidéo en remux (`-c copy`, sans réencodage) en injectant
+    le tag creation_time, vers un fichier temporaire. La date est ensuite
+    relue (ffprobe) et vérifiée avant de remplacer l'original.
+    Lève FileNotFoundError si ffmpeg est absent, RuntimeError sinon.
+    """
+    iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    tmp = filepath.with_name(f"{filepath.stem}.datetmp{filepath.suffix}")
+
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(filepath),
+        "-map", "0", "-c", "copy",
+        "-map_metadata", "0",
+        "-metadata", f"creation_time={iso}",
+        str(tmp),
+    ]
+
     try:
-        with open(filepath, "rb") as f:
-            data = f.read(min(4 * 1024 * 1024, os.path.getsize(filepath)))
-        if data[:4] != b"RIFF" or data[8:12] != b"AVI ":
-            return None
-        offset = 12
-        while offset < len(data) - 8:
-            chunk_id   = data[offset:offset+4]
-            chunk_size = struct.unpack("<I", data[offset+4:offset+8])[0]
-            if chunk_id == b"LIST" and data[offset+8:offset+12] == b"INFO":
-                inner = offset + 12
-                end   = offset + 8 + chunk_size
-                while inner < end - 8:
-                    sub_id   = data[inner:inner+4]
-                    sub_size = struct.unpack("<I", data[inner+4:inner+8])[0]
-                    if sub_id == b"ICRD":
-                        val = data[inner+8:inner+8+sub_size].rstrip(b"\x00")
-                        return val.decode("latin-1", errors="replace").strip()
-                    inner += 8 + sub_size + (sub_size % 2)
-            offset += 8 + chunk_size + (chunk_size % 2)
-    except Exception:
-        pass
-    return None
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+            err = (proc.stderr or "").strip()
+            raise RuntimeError(err.splitlines()[-1] if err else "échec ffmpeg")
 
+        written = _ffprobe_date(tmp)
+        if written is None:
+            raise RuntimeError("ce conteneur ne conserve pas creation_time")
+        if abs((written - dt).total_seconds()) > 48 * 3600:
+            raise RuntimeError(f"date relue incohérente ({written:%Y-%m-%d})")
 
-def _write_avi_icrd(filepath: Path, date_str: str) -> None:
-    """
-    Écrit (ou remplace) le chunk ICRD dans le bloc LIST INFO d'un AVI.
-    Si le bloc LIST INFO n'existe pas, il est créé juste après le header AVI.
-    La date est formatée en chaîne ISO : YYYY-MM-DD HH:MM:SS
-    """
-    with open(filepath, "r+b") as f:
-        data = bytearray(f.read())
+        os.replace(str(tmp), str(filepath))
+    finally:
+        if tmp.exists():
+            try:
+                os.remove(str(tmp))
+            except OSError:
+                pass
 
-    if data[:4] != b"RIFF" or data[8:12] != b"AVI ":
-        raise ValueError("Pas un fichier AVI valide")
-
-    icrd_value = date_str.encode("latin-1") + b"\x00"
-    if len(icrd_value) % 2 != 0:
-        icrd_value += b"\x00"  # padding RIFF word-align
-
-    # Cherche un LIST INFO existant
-    offset = 12
-    list_info_offset = None
-    while offset < len(data) - 8:
-        chunk_id   = data[offset:offset+4]
-        chunk_size = struct.unpack("<I", data[offset+4:offset+8])[0]
-        if chunk_id == b"LIST" and data[offset+8:offset+12] == b"INFO":
-            list_info_offset = offset
-            break
-        offset += 8 + chunk_size + (chunk_size % 2)
-
-    if list_info_offset is not None:
-        # Cherche ICRD dans ce LIST INFO
-        list_size = struct.unpack("<I", data[list_info_offset+4:list_info_offset+8])[0]
-        inner     = list_info_offset + 12
-        end       = list_info_offset + 8 + list_size
-        icrd_offset = None
-        while inner < end - 8:
-            sub_id   = data[inner:inner+4]
-            sub_size = struct.unpack("<I", data[inner+4:inner+8])[0]
-            if sub_id == b"ICRD":
-                icrd_offset = inner
-                break
-            inner += 8 + sub_size + (sub_size % 2)
-
-        new_icrd_chunk = b"ICRD" + struct.pack("<I", len(icrd_value)) + icrd_value
-
-        if icrd_offset is not None:
-            # Remplace l'ancien chunk ICRD
-            old_size     = struct.unpack("<I", data[icrd_offset+4:icrd_offset+8])[0]
-            old_size_pad = old_size + (old_size % 2)
-            data[icrd_offset:icrd_offset+8+old_size_pad] = new_icrd_chunk
-        else:
-            # Insère ICRD à la fin du LIST INFO
-            insert_pos = end
-            data[insert_pos:insert_pos] = new_icrd_chunk
-
-        # Recalcule la taille du LIST INFO
-        new_list_size = len(data) - list_info_offset - 8
-        # Retrouve la vraie taille (distance jusqu'au prochain chunk de même niveau)
-        # Plus simple : on recalcule depuis l'intérieur
-        inner = list_info_offset + 12
-        content_size = 4  # "INFO" type
-        while inner < len(data) - 8:
-            sub_id   = data[inner:inner+4]
-            if sub_id in (b"RIFF", b"LIST", b"idx1", b"movi") or sub_id == bytes(4):
-                break
-            sub_size = struct.unpack("<I", data[inner+4:inner+8])[0]
-            content_size += 8 + sub_size + (sub_size % 2)
-            inner += 8 + sub_size + (sub_size % 2)
-        struct.pack_into("<I", data, list_info_offset+4, content_size)
-
-    else:
-        # Crée un nouveau LIST INFO après le header AVI (offset 12)
-        new_icrd_chunk  = b"ICRD" + struct.pack("<I", len(icrd_value)) + icrd_value
-        list_content    = b"INFO" + new_icrd_chunk
-        new_list_chunk  = b"LIST" + struct.pack("<I", len(list_content)) + list_content
-        data[12:12]     = new_list_chunk
-
-    # Met à jour la taille globale RIFF
-    struct.pack_into("<I", data, 4, len(data) - 8)
-
-    with open(filepath, "wb") as f:
-        f.write(data)
 
 def fix_video(filepath: Path, date: bytes, dry_run: bool) -> str:
-    """
-    Injecte la date de création dans une vidéo :
-    - MP4/MOV/M4V/3GP : atome mvhd (natif ISO BMFF, sans dépendance)
-    - AVI             : chunk ICRD dans LIST INFO (RIFF natif, sans dépendance)
-    """
-    ext      = filepath.suffix.lower()
-    date_str = date.decode("utf-8", errors="replace") if isinstance(date, bytes) else str(date)
+    """Injecte la date de création dans une vidéo MKV via ffmpeg (remux)."""
+    dt = _parse_any_date(date)
+    if dt is None:
+        return "erreur: date source illisible"
 
-    # Normalise vers "YYYY-MM-DD HH:MM:SS"
+    if dry_run:
+        return f"DRY RUN — serait mis à jour (ffmpeg creation_time={dt:%Y-%m-%d %H:%M:%S})"
+
     try:
-        dt      = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
-        date_iso = dt.strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        date_iso = date_str
-
-    # ── AVI (RIFF natif) ──────────────────────────────────────────────────────
-    if ext == ".avi":
-        if dry_run:
-            return "DRY RUN — serait mis à jour (RIFF ICRD)"
-        try:
-            _write_avi_icrd(filepath, date_iso)
-            return "corrigé ✅ (RIFF ICRD)"
-        except Exception as e:
-            return f"erreur écriture AVI: {e}"
-
-    # ── MP4 / MOV / M4V / 3GP (natif — atome mvhd) ──────────────────────────
-    if ext in {".mp4", ".mov", ".m4v", ".3gp"}:
-        if dry_run:
-            return "DRY RUN — serait mis à jour (mvhd)"
-        try:
-            _write_mp4_creation_date(filepath, date_iso)
-            return "corrigé ✅ (mvhd)"
-        except Exception as e:
-            return f"erreur écriture MP4: {e}"
-
-    return "correction non supportée pour ce format vidéo"
+        _ffmpeg_set_creation_time(filepath, dt)
+        return "corrigé ✅ (ffmpeg)"
+    except FileNotFoundError:
+        return "erreur: ffmpeg introuvable sur le PATH"
+    except Exception as e:
+        return f"erreur écriture vidéo: {e}"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCAN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_and_fix(root: Path, dry_run: bool, fix_photos: bool, fix_videos: bool) -> list[dict]:
+def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool,
+                 fix_photos: bool, fix_videos: bool) -> list[dict]:
     results = []
     all_files = sorted(root.rglob("*"))
     media_files = [
@@ -536,7 +437,7 @@ def scan_and_fix(root: Path, dry_run: bool, fix_photos: bool, fix_videos: bool) 
 
     total = len(media_files)
     mode  = "🧪 DRY RUN" if dry_run else "✏️  ÉCRITURE"
-    print(f"\n{mode} — {total} fichier(s) média dans « {root} »\n")
+    logger.info("%s — %d fichier(s) média dans « %s »", mode, total, root)
 
     for i, filepath in enumerate(media_files, 1):
         is_video = filepath.suffix.lower() in VIDEO_EXTENSIONS
@@ -558,9 +459,9 @@ def scan_and_fix(root: Path, dry_run: bool, fix_photos: bool, fix_videos: bool) 
             else:
                 fix_result = "⛔ aucune date disponible"
 
-            print(f"  ⚠️  [{i}/{total}] {filepath}")
-            print(f"       source date : {date_source or 'introuvable'}")
-            print(f"       action      : {fix_result}")
+            logger.warning("[%d/%d] %s", i, total, filepath)
+            logger.warning("       source date : %s", date_source or "introuvable")
+            logger.warning("       action      : %s", fix_result)
 
         record = {
             "fichier":              str(filepath),
@@ -582,31 +483,30 @@ def scan_and_fix(root: Path, dry_run: bool, fix_photos: bool, fix_videos: bool) 
 # RAPPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
-def print_summary(results: list[dict], dry_run: bool) -> None:
+def print_summary(results: list[dict], logger: logging.Logger, dry_run: bool) -> None:
     ok       = sum(1 for r in results if r["tag_critique_present"])
     ko       = sum(1 for r in results if not r["tag_critique_present"])
     fixed    = sum(1 for r in results if "corrigé" in r["action"] or "DRY RUN" in r["action"])
     unfixable= sum(1 for r in results if "introuvable" in r["action"] or "⛔" in r["action"])
-    errors   = sum(1 for r in results if r["erreur"])
+    errors   = sum(1 for r in results if r["erreur"] or "erreur" in r["action"])
     total    = len(results)
 
-    print("\n" + "═" * 60)
-    print(f"  RÉSUMÉ {'(DRY RUN)' if dry_run else ''}")
-    print("═" * 60)
-    print(f"  Total analysé        : {total}")
-    print(f"  ✅ Tag déjà OK       : {ok}")
-    print(f"  ⚠️  Tag manquant      : {ko}")
-    print(f"  🔧 Corrigé{'(simulé)' if dry_run else ''}  : {fixed}")
-    print(f"  ⛔ Non corrigeable   : {unfixable}")
+    logger.info("=" * 60)
+    logger.info("RÉSUMÉ %s", "(DRY RUN)" if dry_run else "")
+    logger.info("  Total analysé        : %d", total)
+    logger.info("  ✅ Tag déjà OK       : %d", ok)
+    logger.info("  ⚠️  Tag manquant      : %d", ko)
+    logger.info("  🔧 Corrigé%s  : %d", "(simulé)" if dry_run else "", fixed)
+    logger.info("  ⛔ Non corrigeable   : %d", unfixable)
     if errors:
-        print(f"  ❌ Erreurs lecture  : {errors}")
-    print("═" * 60)
+        logger.info("  ❌ Erreurs          : %d", errors)
+    logger.info("=" * 60)
 
     if dry_run and fixed > 0:
-        print("\n💡  C'est un DRY RUN. Passez DRY_RUN = False pour appliquer les corrections.")
+        logger.info("💡  C'est un DRY RUN. Passez DRY_RUN=false (env) pour appliquer les corrections.")
 
 
-def save_csv(results: list[dict], output_path: str) -> None:
+def save_csv(results: list[dict], output_path: str, logger: logging.Logger) -> None:
     fieldnames = [
         "fichier", "type", "tag_critique_present", "date_principale",
         "tags_presents", "tags_manquants", "date_source", "action", "erreur",
@@ -615,30 +515,52 @@ def save_csv(results: list[dict], output_path: str) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
-    print(f"\n📄  Rapport CSV enregistré : {output_path}")
+    logger.info("📄  Rapport CSV enregistré : %s", output_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # POINT D'ENTRÉE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main():
-    root = Path(REPERTOIRE)
-    if not root.exists():
-        print(f"❌  Répertoire introuvable : {root}", file=sys.stderr)
-        sys.exit(1)
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
-    results = scan_and_fix(root, dry_run=DRY_RUN, fix_photos=FIX_PHOTOS, fix_videos=FIX_VIDEOS)
-    print_summary(results, dry_run=DRY_RUN)
+
+def main() -> int:
+    logger = setup_logging()
+    root = Path(SOURCE)
+
+    mode = "DRY RUN (simulation)" if DRY_RUN else "ÉCRITURE RÉELLE"
+    logger.info("=" * 64)
+    logger.info("Mode    : %s", mode)
+    logger.info("Source  : %s", root)
+    logger.info("Cibles  : photos=%s  vidéos=%s", FIX_PHOTOS, FIX_VIDEOS)
+    logger.info("=" * 64)
+
+    if not root.is_dir():
+        logger.error("Répertoire source introuvable : %s", root)
+        return 1
+
+    if FIX_VIDEOS and not _ffmpeg_available():
+        logger.warning(
+            "ffmpeg/ffprobe introuvables sur le PATH : "
+            "la lecture et la correction des vidéos échoueront."
+        )
+
+    results = scan_and_fix(root, logger, dry_run=DRY_RUN,
+                           fix_photos=FIX_PHOTOS, fix_videos=FIX_VIDEOS)
+    print_summary(results, logger, dry_run=DRY_RUN)
 
     if EXPORT_CSV:
-        save_csv(results, EXPORT_CSV)
+        save_csv(results, EXPORT_CSV, logger)
 
     if EXPORT_JSON:
         with open(EXPORT_JSON, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"📄  Rapport JSON enregistré : {EXPORT_JSON}")
+        logger.info("📄  Rapport JSON enregistré : %s", EXPORT_JSON)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

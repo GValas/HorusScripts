@@ -2,8 +2,8 @@ FROM python:3.12-slim
 
 # Dépendances système
 # - ffmpeg : fournit les binaires ffmpeg ET ffprobe, requis par
-#   src/cine-videos/convert-h265.py et src/zzz/convert-perso-movies-to-mkv-h265.py
-#   (NB : convert-h265.py encode en hevc_nvenc / NVENC et nécessite donc en plus
+#   src/cine-videos/02-convert-to-h265.py et src/zzz/convert-perso-movies-to-mkv-h265.py
+#   (NB : 02-convert-to-h265.py encode en hevc_nvenc / NVENC et nécessite donc en plus
 #    un GPU NVIDIA + drivers exposés au conteneur pour fonctionner à l'exécution).
 # tzdata : aligne les timestamps des logs sur l'heure de Paris (sinon UTC, -2h).
 RUN apt-get update \
@@ -13,10 +13,15 @@ RUN apt-get update \
 # Fuseau horaire : timestamps des logs à l'heure de Paris.
 ENV TZ=Europe/Paris
 
-# Dépendances Python des scripts src/zzz/ (non déclarées dans requirements.txt) :
-# - piexif  : lecture/écriture des dates EXIF des photos
-# - hachoir : extraction des métadonnées vidéo (fallback dans enrich-movies-photos-with-date.py)
-RUN pip install --no-cache-dir piexif hachoir
+# Dépendances Python des scripts (non déclarées dans requirements.txt) :
+# - piexif      : lecture/écriture des dates EXIF des photos
+# - hachoir     : extraction des métadonnées vidéo (fallback dans 01-enrich-movies-photos-with-date.py)
+# - Pillow      : redimensionnement/ré-encodage des photos (02-compress-for-gphotos.py)
+# - pillow-heif : support des photos .heic/.heif (iPhone) — wheels manylinux,
+#                 libheif embarquée, pas de dépendance apt à ajouter.
+# - google-auth-oauthlib + requests : upload Google Photos (03-upload-to-gphotos.py)
+RUN pip install --no-cache-dir piexif hachoir Pillow pillow-heif \
+    google-auth-oauthlib requests
 
 RUN useradd -m -s /bin/bash devuser
 USER devuser
