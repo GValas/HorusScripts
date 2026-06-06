@@ -6,10 +6,10 @@ env/.env
 .venv/
 venv/
 
-# Secrets / jeton / état Google Photos (upload-to-gphotos.py) — NE PAS committer
-env/gphotos_client_secret.json
-env/gphotos_token.json
-env/gphotos_state.json
+# Config + token rclone (upload Google Photos) — NE PAS committer
+env/rclone.conf
+
+src/archives/
 
 # Dossier de sortie de compress-for-gphotos.py (copies compressées)
 output/

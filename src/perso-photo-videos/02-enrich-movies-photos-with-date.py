@@ -8,18 +8,28 @@ et les corrige automatiquement :
   - vidéos MKV  : tag creation_time via ffmpeg/ffprobe (lu par Google Photos)
 
 Côté vidéo, seul le conteneur MKV est traité : le pipeline amont
-(00-convert-to-mkv+h265.py) garantit que toutes les vidéos sont déjà en .mkv.
+(01-convert-to-mkv+h265.py) garantit que toutes les vidéos sont déjà en .mkv
+(et normalise aussi les photos .jpeg -> .jpg).
 
 Stratégie de date de remplacement (par ordre de priorité) :
   1. Un autre tag de date présent dans le même fichier
-  2. La date d'une photo du même dossier qui possède déjà un tag valide
-  3. Abandon (fichier signalé comme non corrigeable)
+  2. Une date encodée dans le NOM de fichier (YYYYMMDD_HHMMSS, p.ex. issue
+     d'un appareil photo / téléphone) — horodatage de prise de vue explicite
+  3. La date d'une photo du même dossier qui possède déjà un tag valide
+  4. Le préfixe « YY.MM » du dossier parent (ex. « 12.02 - Olivia... » ->
+     2012-02-01) — libellé humain, daté au 1er du mois
+  5. Dernier recours : la date de modification du fichier (mtime)
+  6. Abandon (fichier signalé comme non corrigeable)
+
+C'est ici qu'est concentrée toute l'inférence de date : le pipeline amont
+(01-convert-to-mkv+h265.py) ne fait que CONSERVER les tags existants lors de
+la conversion, sans rien extrapoler.
 
 Les vidéos sont écrites en remux (`-c copy`, sans réencodage) : ffmpeg produit
 un MKV valide, la date relue est vérifiée, et l'original n'est remplacé
 qu'en cas de succès.
 
-Le script tourne dans le même contexte que 02-compress-for-gphotos.py
+Le script tourne dans le même contexte que 03-compress-for-gphotos.py
 (dev/prod container ou local), contre le share monté du NAS.
 
 Dépendances:
@@ -28,71 +38,62 @@ Dépendances:
 """
 
 import os
+import re
 import sys
 import csv
 import json
 import shutil
 import logging
 import subprocess
+import importlib.util
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import piexif
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION (surchargeable par variables d'environnement)
+# CONFIGURATION : tout est dans 00-config.py (ENRICH_*)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_spec = importlib.util.spec_from_file_location(
+    "pipeline_config", Path(__file__).with_name("00-config.py"))
+config = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(config)
 
-def _env_bool(name: str, default: str) -> bool:
-    return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
+SOURCE       = config.NAS_PHOTOS
+EXPORT_CSV   = config.ENRICH_EXPORT_CSV
+EXPORT_JSON  = config.ENRICH_EXPORT_JSON
+DRY_RUN      = config.DRY_RUN
 
-
-# Répertoire racine à scanner : le share photos du NAS (même var que
-# 02-compress-for-gphotos.py pour partager la configuration).
-SOURCE       = os.environ.get("PHOTOS_SOURCE", "/mnt/horus/photos")
-
-# Rapports : chemin vide ("") ou "none" pour désactiver.
-EXPORT_CSV   = os.environ.get("EXPORT_CSV", "rapport.csv")
-EXPORT_JSON  = os.environ.get("EXPORT_JSON", "")
-if EXPORT_CSV.lower() in ("", "none"):
-    EXPORT_CSV = None
-if EXPORT_JSON.lower() in ("", "none"):
-    EXPORT_JSON = None
-
-# DRY_RUN : True = simulation, aucun fichier modifié. Défaut sûr.
-DRY_RUN      = _env_bool("DRY_RUN", "true")
-FIX_PHOTOS   = _env_bool("FIX_PHOTOS", "true")   # Corriger les photos JPEG
-FIX_VIDEOS   = _env_bool("FIX_VIDEOS", "true")   # Corriger les vidéos
+PHOTO_EXTENSIONS = config.PHOTO_EXT
+VIDEO_EXTENSIONS = config.VIDEO_EXT
+DATE_TAG_KEYS = config.ENRICH_DATE_TAG_KEYS
+MIN_PLAUSIBLE_YEAR = config.MIN_PLAUSIBLE_YEAR
+MAX_PLAUSIBLE_YEAR = config.MAX_PLAUSIBLE_YEAR
 
 # ══════════════════════════════════════════════════════════════════════════════
 
 NULL_DATE = b"0000:00:00 00:00:00"
 
-PHOTO_EXTENSIONS = {".jpg", ".jpeg"}
-
-# Vidéos : uniquement le MKV (le pipeline amont normalise tout en .mkv).
-VIDEO_EXTENSIONS = {".mkv"}
-
-# Clés de tags de date reconnues dans la sortie ffprobe (insensible à la casse).
-# Tags pertinents pour le conteneur MKV (Matroska) : creation_time injecté par
-# ffmpeg, et les champs natifs date / date_recorded.
-DATE_TAG_KEYS = {
-    "creation_time",
-    "date",
-    "date_recorded",
-}
-
-# Bornes de plausibilité : rejette les dates epoch (1970 Unix, et 1904 hérité
-# d'anciens conteneurs) que certains encodeurs écrivent au lieu d'une vraie date.
-MIN_PLAUSIBLE_YEAR = 1990
-MAX_PLAUSIBLE_YEAR = 2100
-
 # Cache : pour chaque dossier, la première date valide trouvée dans le dossier
 _folder_date_cache: dict[Path, bytes | None] = {}
 
 
+def _use_paris_timezone() -> None:
+    """Force l'heure de Paris dans les timestamps de log, quel que soit le
+    fuseau du système/conteneur (sinon UTC -> décalage de 1-2h)."""
+    try:
+        paris = ZoneInfo("Europe/Paris")
+        logging.Formatter.converter = staticmethod(
+            lambda ts: datetime.fromtimestamp(ts, paris).timetuple()
+        )
+    except Exception:
+        pass  # base de fuseaux indisponible -> heure système par défaut
+
+
 def setup_logging() -> logging.Logger:
+    _use_paris_timezone()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -274,6 +275,94 @@ def _best_date_from_tags(info: dict) -> bytes | None:
     return None
 
 
+# Motifs de date dans un nom de fichier, essayés dans l'ordre. Chacun capture
+# (année, mois, jour, heure, minute, seconde) dans cet ordre. Les lookarounds
+# (?<!\d)/(?!\d) évitent de capturer une sous-chaîne d'un nombre plus long.
+_FILENAME_DATE_RES = (
+    # Compact : 20100102182726, 20190615_143022, VID_20190615-143022
+    re.compile(
+        r"(?<!\d)(19\d{2}|20\d{2})(\d{2})(\d{2})[ _\-]?(\d{2})(\d{2})(\d{2})(?!\d)"
+    ),
+    # Séparé : 2022-06-19 at 21.59.44 (capture d'écran macOS),
+    # 2022-06-19_21-59-44, 2022.06.19 21:59:44, 2022-06-19T21:59:44…
+    # Date avec séparateurs (-, _, .) ; entre date et heure : espace(s)/_/T ou
+    # « at » ; heure avec séparateurs optionnels (-, _, ., :).
+    re.compile(
+        r"(?<!\d)(19\d{2}|20\d{2})[-_.](\d{2})[-_.](\d{2})"
+        r"(?:[ T_]+|[ ]at[ ])(\d{2})[-_.:]?(\d{2})[-_.:]?(\d{2})(?!\d)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _date_from_filename(filepath: Path) -> bytes | None:
+    """
+    Extrait une date de prise de vue du nom de fichier et la renvoie au format
+    EXIF (b"YYYY:MM:DD HH:MM:SS"). Gère le format compact (YYYYMMDDHHMMSS) et le
+    format séparé (« 2022-06-19 at 21.59.44 »). Retourne None si aucun motif, ou
+    si les composantes ne forment pas une date réelle / plausible.
+    """
+    for regex in _FILENAME_DATE_RES:
+        m = regex.search(filepath.stem)
+        if not m:
+            continue
+        year, month, day, hour, minute, second = (int(g) for g in m.groups())
+        try:
+            dt = datetime(year, month, day, hour, minute, second)
+        except ValueError:
+            continue
+        if not _is_plausible_date(dt):
+            continue
+        return dt.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+    return None
+
+
+# Préfixe « YY.MM » d'un nom de dossier (ex. « 12.02 - Olivia... »). On exige
+# que les 4 chiffres soient suivis d'un non-chiffre ou de la fin, pour ne pas
+# confondre avec une année à 4 chiffres (« 2012.02 » ne matche pas).
+_FOLDER_YYMM_RE = re.compile(r"^(\d{2})\.(\d{2})(?:\D|$)")
+
+
+def _date_from_parent_folder(filepath: Path) -> bytes | None:
+    """
+    Si le dossier contenant le fichier commence par « YY.MM » (mois/année
+    abrégés, ex. « 12.02 - Olivia... » -> février 2012), renvoie une date au
+    1er du mois au format EXIF. L'année à 2 chiffres est résolue par fenêtre
+    glissante autour de l'année courante (YY <= année courante -> 20YY,
+    sinon 19YY). Renvoie None si pas de motif ou date invraisemblable.
+    """
+    m = _FOLDER_YYMM_RE.match(filepath.parent.name)
+    if not m:
+        return None
+    yy, month = int(m.group(1)), int(m.group(2))
+    if not 1 <= month <= 12:
+        return None
+    current_yy = datetime.now().year % 100
+    year = 2000 + yy if yy <= current_yy else 1900 + yy
+    try:
+        dt = datetime(year, month, 1)
+    except ValueError:
+        return None
+    if not _is_plausible_date(dt):
+        return None
+    return dt.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+
+
+def _date_from_mtime(filepath: Path) -> bytes | None:
+    """
+    Dernier recours : la date de modification du fichier, au format EXIF.
+    Toujours disponible mais peu fiable (peut être une date de copie) — n'est
+    utilisée que si aucune autre source n'a abouti.
+    """
+    try:
+        dt = datetime.fromtimestamp(filepath.stat().st_mtime)
+    except OSError:
+        return None
+    if not _is_plausible_date(dt):
+        return None
+    return dt.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+
+
 def _date_from_folder(filepath: Path) -> bytes | None:
     """
     Cherche la date d'une autre photo JPEG dans le même dossier
@@ -288,7 +377,7 @@ def _date_from_folder(filepath: Path) -> bytes | None:
     for sibling in sorted(folder.iterdir()):
         if sibling == filepath:
             continue
-        if sibling.suffix.lower() not in PHOTO_EXTENSIONS:
+        if sibling.suffix.lower() != PHOTO_EXTENSIONS:
             continue
         try:
             pic = piexif.load(str(sibling))
@@ -313,10 +402,25 @@ def resolve_date(filepath: Path, info: dict) -> tuple[bytes | None, str]:
     if date:
         return date, "tag existant dans le fichier"
 
-    # Priorité 2 : date d'une photo voisine dans le même dossier
+    # Priorité 2 : date encodée dans le nom de fichier (horodatage explicite)
+    date = _date_from_filename(filepath)
+    if date:
+        return date, "nom de fichier (YYYYMMDD_HHMMSS)"
+
+    # Priorité 3 : date d'une photo voisine dans le même dossier
     date = _date_from_folder(filepath)
     if date:
         return date, f"photo voisine dans {filepath.parent.name}/"
+
+    # Priorité 4 : préfixe « YY.MM » du dossier parent (1er du mois)
+    date = _date_from_parent_folder(filepath)
+    if date:
+        return date, f"dossier « {filepath.parent.name} » (YY.MM)"
+
+    # Priorité 5 : dernier recours, date de modification (mtime)
+    date = _date_from_mtime(filepath)
+    if date:
+        return date, "date de modification (mtime)"
 
     return None, "introuvable"
 
@@ -426,13 +530,12 @@ def fix_video(filepath: Path, date: bytes, dry_run: bool) -> str:
 # SCAN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool,
-                 fix_photos: bool, fix_videos: bool) -> list[dict]:
+def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool) -> list[dict]:
     results = []
     all_files = sorted(root.rglob("*"))
     media_files = [
         f for f in all_files
-        if f.is_file() and f.suffix.lower() in (PHOTO_EXTENSIONS | VIDEO_EXTENSIONS)
+        if f.is_file() and f.suffix.lower() in (PHOTO_EXTENSIONS, VIDEO_EXTENSIONS)
     ]
 
     total = len(media_files)
@@ -440,7 +543,7 @@ def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool,
     logger.info("%s — %d fichier(s) média dans « %s »", mode, total, root)
 
     for i, filepath in enumerate(media_files, 1):
-        is_video = filepath.suffix.lower() in VIDEO_EXTENSIONS
+        is_video = filepath.suffix.lower() == VIDEO_EXTENSIONS
         info     = check_video_tags(filepath) if is_video else check_photo_tags(filepath)
 
         fix_result = None
@@ -450,12 +553,10 @@ def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool,
             date, date_source = resolve_date(filepath, info)
 
             if date:
-                if is_video and fix_videos:
+                if is_video:
                     fix_result = fix_video(filepath, date, dry_run)
-                elif not is_video and fix_photos:
-                    fix_result = fix_photo(filepath, info, date, dry_run)
                 else:
-                    fix_result = "correction désactivée"
+                    fix_result = fix_photo(filepath, info, date, dry_run)
             else:
                 fix_result = "⛔ aucune date disponible"
 
@@ -534,21 +635,19 @@ def main() -> int:
     logger.info("=" * 64)
     logger.info("Mode    : %s", mode)
     logger.info("Source  : %s", root)
-    logger.info("Cibles  : photos=%s  vidéos=%s", FIX_PHOTOS, FIX_VIDEOS)
     logger.info("=" * 64)
 
     if not root.is_dir():
         logger.error("Répertoire source introuvable : %s", root)
         return 1
 
-    if FIX_VIDEOS and not _ffmpeg_available():
+    if not _ffmpeg_available():
         logger.warning(
             "ffmpeg/ffprobe introuvables sur le PATH : "
             "la lecture et la correction des vidéos échoueront."
         )
 
-    results = scan_and_fix(root, logger, dry_run=DRY_RUN,
-                           fix_photos=FIX_PHOTOS, fix_videos=FIX_VIDEOS)
+    results = scan_and_fix(root, logger, dry_run=DRY_RUN)
     print_summary(results, logger, dry_run=DRY_RUN)
 
     if EXPORT_CSV:

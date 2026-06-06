@@ -1,15 +1,18 @@
 ##################################################################
 ## Compresse récursivement le share photos/vidéos perso du NAS vers
 ## un dossier local, en recopiant l'arborescence à l'identique.
-##   - photos : redimensionnées (max 1024px) + JPEG qualité 85, EXIF conservé
-##   - vidéos : ré-encodées 720p H.265 (hevc_nvenc / NVENC) / AAC en .mp4 (web)
+##   - photos (.jpg) : redimensionnées (max MAX_PHOTO_SIZE) + JPEG, EXIF conservé
+##   - vidéos (.mkv) : ré-encodées 720p H.265 (hevc_nvenc / NVENC) / AAC en .mkv
+##
+## En amont, 00 normalise toutes les vidéos en .mkv et 01 toutes les photos en
+## .jpg : ce script ne traite donc QUE le .jpg et le .mkv ; tout autre fichier
+## est ignoré.
 ##
 ## L'arborescence du dossier de sortie est ensuite consommée par le
 ## script d'upload Google Photos (un album par sous-dossier).
 ##
 ## Dépendances non déclarées (à installer à la main, cf. CLAUDE.md) :
 ##   - Pillow            (photos)        pip install Pillow
-##   - pillow-heif       (photos .heic)  pip install pillow-heif   [optionnel]
 ##   - ffmpeg            (vidéos)        binaire sur le PATH, build NVENC
 ##   - GPU NVIDIA + nvidia-container-toolkit exposé au conteneur (hevc_nvenc).
 ##     Le devcontainer le fait déjà (runArgs --gpus all + caps "video").
@@ -21,57 +24,55 @@ import json
 import shutil
 import logging
 import subprocess
+import importlib.util
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageFile
 
-# pillow-heif : support optionnel des .heic/.heif (iPhone). Sans lui, ces
-# fichiers sont simplement ignorés avec un avertissement.
-try:
-    import pillow_heif  # type: ignore
-
-    pillow_heif.register_heif_opener()
-    HEIF_OK = True
-except ImportError:
-    HEIF_OK = False
+# Tolère les JPEG légèrement tronqués (quelques octets manquants en fin de
+# fichier) : Pillow complète au lieu d'échouer. Sans ça, ces fichiers sont
+# perdus à la compression.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 ##################################################################
-## Configuration (surchargeable par variables d'environnement)
+## Configuration : tout est dans 00-config.py (COMPRESS_*)
 ##################################################################
 
-# Dossier source à parcourir (le share photos du NAS).
-SOURCE = os.environ.get("PHOTOS_SOURCE", "/mnt/horus/photos")
+_spec = importlib.util.spec_from_file_location(
+    "pipeline_config", Path(__file__).with_name("00-config.py"))
+config = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(config)
 
-# Dossier de sortie local : reçoit l'arborescence + les copies compressées.
-# Par défaut, à côté du script (../../output/gphotos depuis ce fichier).
-OUTPUT = os.environ.get(
-    "OUTPUT_FOLDER",
-    str(Path(__file__).resolve().parent.parent.parent / "output" / "gphotos"),
-)
-
-# DRY_RUN : True = simulation, aucun fichier écrit. Défaut sûr.
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("1", "true", "yes", "on")
-
-# Photos : côté le plus long borné à cette valeur (px).
-MAX_PHOTO_SIZE = int(os.environ.get("MAX_PHOTO_SIZE", "1024"))
-JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "85"))
-
-# Vidéos : hauteur max (px), qualité NVENC (CQ, + bas = mieux), preset NVENC.
-VIDEO_HEIGHT = int(os.environ.get("VIDEO_HEIGHT", "720"))
-VIDEO_CQ = int(os.environ.get("VIDEO_CQ", "28"))  # 24–30 conseillé
-VIDEO_PRESET = os.environ.get("VIDEO_PRESET", "p4")  # p1 (rapide) → p7 (qualité)
-
-PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
-HEIF_EXTS = {".heic", ".heif"}
-VIDEO_EXTS = {
-    ".mp4", ".mov", ".avi", ".mkv", ".m4v", ".3gp",
-    ".mpg", ".mpeg", ".wmv", ".flv", ".webm",
-}
+SOURCE = config.NAS_PHOTOS
+OUTPUT = config.COMPRESS_OUTPUT
+DRY_RUN = config.DRY_RUN
+MAX_PHOTO_SIZE = config.COMPRESS_MAX_PHOTO_SIZE
+JPEG_QUALITY = config.COMPRESS_JPEG_QUALITY
+VIDEO_HEIGHT = config.COMPRESS_VIDEO_HEIGHT
+VIDEO_CQ = config.VIDEO_CQ
+VIDEO_PRESET = config.VIDEO_PRESET
+PHOTO_EXTS = config.PHOTO_EXT
+VIDEO_EXTS = config.VIDEO_EXT
 
 ##################################################################
+
+
+def _use_paris_timezone() -> None:
+    """Force l'heure de Paris dans les timestamps de log, quel que soit le
+    fuseau du système/conteneur (sinon UTC -> décalage de 1-2h)."""
+    try:
+        paris = ZoneInfo("Europe/Paris")
+        logging.Formatter.converter = staticmethod(
+            lambda ts: datetime.fromtimestamp(ts, paris).timetuple()
+        )
+    except Exception:
+        pass  # base de fuseaux indisponible -> heure système par défaut
 
 
 def setup_logging() -> logging.Logger:
+    _use_paris_timezone()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -157,7 +158,7 @@ def compress_photo(src: Path, dst: Path, logger: logging.Logger) -> bool:
 
 
 def compress_video(src: Path, dst: Path, logger: logging.Logger) -> bool:
-    """Ré-encode en 720p H.265 NVENC / AAC MP4 (faststart) pour diffusion web."""
+    """Ré-encode en 720p H.265 NVENC / AAC, conteneur MKV."""
     if DRY_RUN:
         logger.info("[DRY RUN] VIDEO  %s  →  %s", src.name, dst.name)
         return True
@@ -186,7 +187,6 @@ def compress_video(src: Path, dst: Path, logger: logging.Logger) -> bool:
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
-        "-movflags", "+faststart",  # web : index au début du fichier
     ]
     if creation_time:
         cmd += ["-metadata", f"creation_time={creation_time}"]
@@ -206,15 +206,26 @@ def compress_video(src: Path, dst: Path, logger: logging.Logger) -> bool:
     return True
 
 
+def in_excluded_folder(src: Path, source_root: Path) -> bool:
+    """
+    Vrai si le fichier est sous un dossier dont le nom commence par « _ »
+    (ex. _to_be_sorted/). Ces dossiers de travail/brouillon ne doivent pas
+    partir vers Google Photos. Seuls les composants de dossier SOUS la racine
+    sont testés (la racine elle-même est ignorée).
+    """
+    rel = src.relative_to(source_root)
+    return any(part.startswith("_") for part in rel.parts[:-1])
+
+
 def target_for(src: Path, source_root: Path, output_root: Path):
     """(cible, type) pour un fichier source ; (None, 'skip') si non géré."""
     ext = src.suffix.lower()
     rel = src.relative_to(source_root)
 
-    if ext in PHOTO_EXTS or ext in HEIF_EXTS:
+    if ext == PHOTO_EXTS:
         return output_root / rel.with_suffix(".jpg"), "photo"
-    if ext in VIDEO_EXTS:
-        return output_root / rel.with_suffix(".mp4"), "video"
+    if ext == VIDEO_EXTS:
+        return output_root / rel.with_suffix(".mkv"), "video"
     return None, "skip"
 
 
@@ -228,33 +239,32 @@ def main() -> int:
     logger.info("Mode    : %s", mode)
     logger.info("Source  : %s", source_root)
     logger.info("Sortie  : %s", output_root)
-    logger.info("Photos  : max %dpx, JPEG q%d", MAX_PHOTO_SIZE, JPEG_QUALITY)
-    logger.info("Vidéos  : %dp, hevc_nvenc CQ %d, preset %s",
+    logger.info("Photos  : .jpg, max %dpx, JPEG q%d", MAX_PHOTO_SIZE, JPEG_QUALITY)
+    logger.info("Vidéos  : .mkv -> %dp, hevc_nvenc CQ %d, preset %s",
                 VIDEO_HEIGHT, VIDEO_CQ, VIDEO_PRESET)
-    if not HEIF_OK:
-        logger.info("HEIC    : support désactivé (pip install pillow-heif)")
     logger.info("=" * 64)
 
     if not source_root.is_dir():
         logger.error("Dossier source introuvable : %s", source_root)
         return 1
 
-    photos = videos = skipped = errors = already = collisions = 0
+    photos = videos = skipped = errors = already = collisions = excluded = 0
     seen_targets: set[str] = set()
 
     for src in sorted(source_root.rglob("*")):
         if not src.is_file():
             continue
 
+        # Ignore les dossiers de travail (nom commençant par « _ »).
+        if in_excluded_folder(src, source_root):
+            logger.debug("Ignoré (dossier « _ ») : %s", src)
+            excluded += 1
+            continue
+
         dst, kind = target_for(src, source_root, output_root)
 
         if kind == "skip":
-            logger.debug("Ignoré (type non géré) : %s", src.name)
-            skipped += 1
-            continue
-
-        if kind == "photo" and src.suffix.lower() in HEIF_EXTS and not HEIF_OK:
-            logger.warning("HEIC ignoré (pillow-heif absent) : %s", src.name)
+            logger.debug("Ignoré (ni .jpg ni .mkv) : %s", src.name)
             skipped += 1
             continue
 
@@ -293,6 +303,7 @@ def main() -> int:
     logger.info("  Vidéos traitées      : %d", videos)
     logger.info("  Déjà présentes       : %d  (cible existante, sautées)", already)
     logger.info("  Collisions           : %d", collisions)
+    logger.info("  Dossiers « _ » exclus: %d", excluded)
     logger.info("  Non gérées / ignorées: %d", skipped)
     logger.info("  Erreurs              : %d", errors)
     if DRY_RUN:

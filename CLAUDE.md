@@ -4,65 +4,107 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A personal collection of standalone Python utility scripts for managing a home NAS named **horus** (SMB/CIFS share holding media: `movies`, `tvshows`, `cartoons`, `photos`, `perso`). Each script in `src/` is independent — there is no shared package, no imports between scripts, no framework. Python 3.12.
+A personal toolkit for managing a home NAS named **horus** (SMB/CIFS share holding media: `movies`, `tvshows`, `cartoons`, `photos`, `perso`). Python 3.12. The repo is organized as **two independent pipelines** under `src/`, plus a scratch/archive folder:
 
-`requirements.txt` is intentionally empty, but that only covers the container scripts. The `src/zzz/` scripts have **undeclared dependencies**: `ffmpeg`/`ffprobe` binaries on PATH (the conversion/deletion scripts) and the `piexif` + `hachoir` PyPI packages (the photo/video date scripts). Install those manually before running a `zzz/` script; don't assume the empty `requirements.txt` means zero deps.
+- **`src/cine-videos/`** — clean movie/TV filenames and re-encode to HEVC. Env-driven, run via **docker-compose**.
+- **`src/perso-photo-videos/`** — a 4-step personal photo/video pipeline (normalize → date → compress → upload to Google Photos). Config-file-driven, run via the **`run-perso-pipeline.sh`** orchestrator.
+- **`src/archives/`** — gitignored scratch: the old Python uploader (`04-…py.bak`), one-off audit scripts, and generated CSV reports. Not part of any pipeline; nothing imports it.
 
-The codebase (comments, log messages, README) is written in **French**. Match that language when editing existing files.
+Both pipelines share a **single Docker image** (`horus-convert-h265`, built from [Dockerfile](Dockerfile)) that bakes in every dependency. The two launchers at the repo root are the entry points:
 
-## Two execution contexts with different path conventions — important
+- [run-cine-pipeline.sh](run-cine-pipeline.sh) — ciné pipeline (via `docker compose`).
+- [run-perso-pipeline.sh](run-perso-pipeline.sh) — perso pipeline (via `docker run`, orchestrating steps 01→04).
 
-Scripts target the NAS in **two incompatible ways**, depending on where they are meant to run:
+The codebase (comments, log messages) is written in **French**. Match that language when editing existing files. (This guidance file is the exception — keep it in English.)
 
-- **Linux / container scripts** read the mount point from the `NAS_MOUNT` env var (`/mnt/wsl/horus`). Example: [src/script.py](src/script.py). These run inside the dev container or the prod container, where the host's SMB mount is bind-mounted in. **Use `/mnt/wsl/horus`, not `/mnt/horus`** — see the NAS-mounting section below for why a `/mnt/horus` bind makes the container see empty folders.
-- **Windows-host scripts** hardcode Windows UNC paths like `r"\\horus\movies"` in a `ROOT`/`ROOTS` constant at the top of the file. Example: [src/clean-movies-names.py](src/clean-movies-names.py) and everything in `src/zzz/`. These are meant to be run directly on a Windows machine against the NAS — they will **not** work in the Linux container as-is.
+## Dependencies
 
-When adding or modifying a script, decide which context it belongs to and follow that context's path convention. Don't assume `NAS_MOUNT` applies to the UNC-path scripts.
+`requirements.txt` is **intentionally empty** — dependencies live in the Docker image, not in pip. The [Dockerfile](Dockerfile) installs everything:
+
+- `ffmpeg`/`ffprobe` — used by both pipelines (codec detection, remux, re-encode).
+- **NVENC / GPU** — all H.265 encoding uses `hevc_nvenc` (NVIDIA GPU only, **no CPU fallback**). The image is based on `nvidia/cuda:*-runtime`; the proprietary `libnvidia-encode` is injected at runtime by nvidia-container-toolkit. Containers must be launched with GPU access **and** `NVIDIA_DRIVER_CAPABILITIES=all` (the launchers do this) — `--gpus all` alone only exposes compute/utility, not the encoder.
+- `Pillow` + `piexif` — perso pipeline only (photo resize in 03, EXIF dates in 02).
+- `rclone` — perso upload (step 04).
+- `tzdata` + `ENV TZ=Europe/Paris` — so log timestamps are Paris time, not UTC.
+
+To run a script outside Docker you'd have to install these yourself, but the intended path is always the Docker image.
+
+## Path convention — `/mnt/wsl/horus`, never `/mnt/horus`
+
+Everything runs in Linux/containers and targets the NAS at **`/mnt/wsl/horus`**. The ciné pipeline reads the mount from the `NAS_MOUNT` env var (`env/.env`); the perso pipeline hardcodes `NAS_PHOTOS = "/mnt/wsl/horus/photos"` in [src/perso-photo-videos/00-config.py](src/perso-photo-videos/00-config.py).
+
+**Use `/mnt/wsl/horus`, not `/mnt/horus`.** A bind on `/mnt/horus` makes the container see empty folders — see the NAS-mounting section below for why. This applies everywhere (containers and local runs).
+
+## The ciné pipeline (`src/cine-videos/`)
+
+Two stdlib-only scripts (ffmpeg/ffprobe binaries aside), driven by **environment variables** (set in `env/.env`, overridable per-run):
+
+- [01-clean-names.py](src/cine-videos/01-clean-names.py) — rename movies/shows: strip technical tokens (codecs, resolutions, release groups) and apply naming conventions. Detects **collisions** (two names mapping to the same target) before applying.
+- [02-convert-to-h265.py](src/cine-videos/02-convert-to-h265.py) — re-encode to HEVC via NVENC, with colorized timestamped logging and stream-count verification.
+
+Both read `INPUT_FOLDERS` (comma-separated NAS dirs) and `DRY_RUN` from the environment. The compose service `convert-h265` runs them in sequence: `python3 01-clean-names.py && python3 02-convert-to-h265.py`.
+
+Run it:
+
+```bash
+./run-cine-pipeline.sh --DRY_RUN=true        # simulate (recommended first)
+./run-cine-pipeline.sh                        # real (default DRY_RUN=false here)
+```
+
+## The perso pipeline (`src/perso-photo-videos/`)
+
+Four numbered steps, **all configured from one file**, [00-config.py](src/perso-photo-videos/00-config.py). There are no env vars and no per-script config blocks — `00-config.py` holds a COMMON section (single `DRY_RUN`, `PHOTO_EXT=.jpg`, `VIDEO_EXT=.mkv`, NVENC `VIDEO_CQ`/`VIDEO_PRESET`, `NAS_PHOTOS`, plausible-year bounds) plus a per-script section (`CONVERT_*`, `ENRICH_*`, `COMPRESS_*`, `UPLOAD_*`). Python steps load it via `importlib` (filenames contain digits/`+`/`-`, so they aren't importable directly); the shell step reads values via a small inline `python3` call.
+
+The steps (each operates on the `photos` share, skipping folders whose name starts with `_`):
+
+1. [01-convert-to-mkv+h265.py](src/perso-photo-videos/01-convert-to-mkv+h265.py) — **format normalization only**. Every video ends up **H.265 + MKV** regardless of source codec/container (re-encodes non-HEVC, including existing `.mkv`, in place via temp + `os.replace`; remuxes already-HEVC). Renames `.jpeg`→`.jpg`. **Preserves existing date tags but never infers them** (that is step 02's job). NVENC-only; aborts if no GPU encoder.
+2. [02-enrich-movies-photos-with-date.py](src/perso-photo-videos/02-enrich-movies-photos-with-date.py) — **all date inference**. Fills missing capture dates from, in priority order: an existing tag → the filename (patterns like `YYYYMMDD_HHMMSS` and `2022-06-19 at 21.59.44`) → a neighboring photo's date in the same folder → a parent `YY.MM` folder name → file mtime. Photos via `piexif`, videos via ffprobe/ffmpeg.
+3. [03-compress-for-gphotos.py](src/perso-photo-videos/03-compress-for-gphotos.py) — write a **compressed copy** to `output/gphotos` (photos resized so the long side ≤ `COMPRESS_MAX_PHOTO_SIZE`, videos re-encoded to `COMPRESS_VIDEO_HEIGHT`p via NVENC). Only ever produces `.jpg` + `.mkv`. `ImageFile.LOAD_TRUNCATED_IMAGES = True` to survive slightly-truncated JPEGs.
+4. [04-upload-to-gphotos.sh](src/perso-photo-videos/04-upload-to-gphotos.sh) — **rclone** upload of `output/gphotos` to Google Photos; each first-level folder becomes an album of the same name. Replaces the old Python uploader (archived in `src/archives/`). Reads `UPLOAD_*` + `DRY_RUN` from `00-config.py`; OAuth credentials come from `env/rclone.conf` (see Configuration).
+
+Run it with the orchestrator:
+
+```bash
+./run-perso-pipeline.sh            # all steps; prompts to confirm if DRY_RUN=False
+./run-perso-pipeline.sh -y         # skip the confirmation
+./run-perso-pipeline.sh 03 04      # run only a subset of steps
+```
+
+The orchestrator mounts the perso scripts live (`-v src/perso-photo-videos:/work`), so editing `00-config.py` takes effect **without rebuilding** the image. It runs the container with `--user "$(id -u):$(id -g)"` so generated files are owned by you, not root.
 
 ## Script conventions
 
-Operational scripts follow a consistent shape (see [src/clean-movies-names.py](src/clean-movies-names.py), the most complete example):
-
-- A configuration block at the top of the file: `ROOT`/`ROOTS` constants and a `DRY_RUN` boolean. **`DRY_RUN = True` means simulate, log what would happen, change nothing.** Always default new destructive scripts to `DRY_RUN = True` and gate every mutating operation (`os.rename`, delete, etc.) behind it.
-- A `setup_logging()` helper returning a configured `logging.Logger` (stdout handler, timestamped format).
-- For rename/move operations, detect **collisions** (two source names mapping to the same target) before applying, and report a final tally (renamed / collisions / errors).
-
-Note the `DRY_RUN` default is **not consistent** across scripts — some are committed with `DRY_RUN = True` (safe), others with `DRY_RUN = False` (live), and a couple have no dry-run guard at all (e.g. [src/zzz/convert-cine-movies-to-h265.py](src/zzz/convert-cine-movies-to-h265.py) always converts). Check the config block before running anything destructive.
-
-### `src/zzz/` — media-processing scripts (Windows host)
-
-These are **full, working implementations**, not stubs — they are kept separate because they require the external deps above and run against the NAS over UNC paths. What they do:
-
-- [convert-cine-movies-to-h265.py](src/zzz/convert-cine-movies-to-h265.py) — re-encode movies to HEVC via **NVENC** (`hevc_nvenc`), writing `*_x265.mkv` alongside originals and verifying stream counts survive.
-- [convert-perso-movies-to-mkv-h265.py](src/zzz/convert-perso-movies-to-mkv-h265.py) — re-encode *legacy-codec* videos (matched against a `LEGACY_CODECS` set) to `libx265` MKV, **deleting the original on success**, with per-extension/per-codec tally and a log file written into the source dir.
-- [delete-cine-movies-x264.py](src/zzz/delete-cine-movies-x264.py) — delete source videos that already have a `*_x265.mkv` counterpart (reclaim space after conversion).
-- [01-enrich-movies-photos-with-date.py](src/zzz/01-enrich-movies-photos-with-date.py) — repair missing date metadata. Photos via `piexif`; videos via **hand-rolled, dependency-free byte-level container parsing** — MP4/MOV `mvhd` atom (ISO BMFF, incl. 64-bit largesize/Mac-epoch handling) and AVI `ICRD` chunk (RIFF `LIST INFO`). When editing the video readers/writers, mind the offset/size arithmetic — these directly mutate binary containers in place. Fallback date strategy: another tag in the same file → a sibling photo's date in the same folder → give up.
-
-`src/zzz/tests/clean_pics.py` is **not a test** — it's a standalone earlier/simpler variant of the photo-date script (it processes a local `./data` folder via `os.getcwd()`). There is no test runner in this project.
-
-## Running
-
-```bash
-# Dev container (VS Code: "Reopen in Container") or local:
-python src/script.py
-
-# Prod container — note env/.env lives in env/, so --env-file is required
-# so docker-compose can interpolate ${NAS_MOUNT} in the volume mapping:
-docker compose --env-file env/.env up
-
-# Lint / format (tools installed in the dev container, not in requirements.txt):
-black src/ && isort src/ && pylint src/
-```
-
-`black` runs on save in the dev container (`editor.formatOnSave`). Keep code black-formatted.
+- **`DRY_RUN` gates every mutating operation** (rename, delete, write, upload). `True` = simulate and log, change nothing. For the perso pipeline there is a **single** `DRY_RUN` in `00-config.py` driving all four steps; it defaults to `True` (safe). For the ciné pipeline `DRY_RUN` is an env var (default `false`). Always check it before running anything destructive — step 01 deletes originals after conversion, and 04 publishes to the internet.
+- A `setup_logging()` / `log()` helper with **timestamped, Paris-timezone** output (the image sets `TZ=Europe/Paris`; some scripts also pin the logging converter to `Europe/Paris`).
+- All H.265 encoding is **NVENC-only** — no CPU/libx265 fallback. A script aborts rather than silently encoding on CPU.
+- Rename/move operations detect **collisions** before applying and report a final tally.
 
 ## Configuration
 
-Copy `env/.env.example` to `env/.env` (gitignored) and set `NAS_MOUNT` (use `/mnt/wsl/horus` — see NAS-mounting section). The same `.env` is consumed by both `docker compose` (volume + container env) and Linux scripts run locally. `NAS_HOST` / `NAS_SHARE` / `NAS_CREDENTIALS` are referenced only by the SMB-mount step.
+- **Ciné:** copy `env/.env.example` → `env/.env` (gitignored). Set `NAS_MOUNT` (= `/mnt/wsl/horus`), `INPUT_FOLDERS`, `DRY_RUN`, and NVENC `CQ`/`PRESET`. Consumed by `docker compose` (volume interpolation + container env).
+- **Perso:** edit [src/perso-photo-videos/00-config.py](src/perso-photo-videos/00-config.py) directly — no env vars.
+- **Upload auth:** copy `env/rclone.conf.example` → `env/rclone.conf` (gitignored) and fill `client_id` / `client_secret` / `token`. Get the token with `rclone authorize "google photos"` on a machine with a browser + rclone (no rclone needed on this host). The launcher bind-mounts this file into the container at runtime — **secrets are never baked into the image and must never be committed** (only the `.example` placeholder is tracked).
+
+## Docker
+
+Both pipelines build the same image, `horus-convert-h265`:
+
+```bash
+# Ciné — compose (env/.env required so ${NAS_MOUNT} interpolates):
+docker compose --env-file env/.env up convert-h265
+# …or just: ./run-cine-pipeline.sh
+
+# Perso — orchestrator (docker run under the hood):
+./run-perso-pipeline.sh
+```
+
+`docker-compose.yml` defines only the `convert-h265` service; the perso pipeline deliberately does **not** go through compose (it needs per-step volume/GPU/user variations that the orchestrator applies in `docker run`). The image's default `CMD` is a neutral "use a launcher" message, so running the bare image does nothing destructive.
+
+`black` runs on save in the dev container (`editor.formatOnSave`). Keep code black-formatted.
 
 ## NAS mounting (WSL host — `/etc/`)
 
-The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from `/etc/wsl.conf` (`[boot] command = /etc/mount-nas-horus.sh`). Both files live in `/etc/`, **not in this repo** (they are host/machine config, require `sudo` to edit). The script mounts the CIFS shares (`photos movies tvshows cartoons`) from `//192.168.1.182` using `~/.nas-credentials` (hardcoded — it does **not** read `env/.env`).
+The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from `/etc/wsl.conf` (`[boot] command = /etc/mount-nas-horus.sh`). Both files live in `/etc/`, **not in this repo** (host/machine config, require `sudo` to edit). The script mounts the CIFS shares (`photos movies tvshows cartoons`) from `//192.168.1.182` using `~/.nas-credentials` (hardcoded — it does **not** read `env/.env`).
 
 Key trick: Docker Desktop runs in a separate WSL distro that only sees Ubuntu's FS via `/mnt/wsl` (propagation `shared`). A CIFS mount under `/mnt/horus` is invisible in containers, so the script mounts the real CIFS under `/mnt/wsl/horus/*` (Docker-visible, `--make-shared`) and bind-mirrors it to `/mnt/horus/*` for convenience. It is idempotent (guards each mount with `mountpoint -q`) and can be re-run by hand.
 

@@ -10,3 +10,7 @@ env/
 .env
 README.md
 docker-compose.yml
+# Sorties / artefacts volumineux : jamais nécessaires au build de l'image
+# (montés au runtime). Évite d'envoyer des Go inutiles dans le contexte.
+output/
+src/archives/

@@ -1,0 +1,20 @@
+# Exemple de configuration rclone pour l'upload Google Photos.
+#
+# UTILISATION :
+#   1) cp env/rclone.conf.example env/rclone.conf   (env/rclone.conf est gitignoré)
+#   2) Remplir client_id / client_secret / token (voir ci-dessous).
+#   run-perso-pipeline.sh (étape 04) monte env/rclone.conf en /cfg/rclone.conf
+#   (RCLONE_CONFIG) ; le token est rafraîchi en mémoire à chaque run.
+#
+# OÙ TROUVER LES VALEURS :
+#   - client_id / client_secret : Google Cloud Console -> API "Photos Library"
+#     activée -> Credentials -> OAuth client ID de type "Desktop".
+#   - token : blob JSON renvoyé par `rclone authorize "google photos"`, à
+#     exécuter sur une machine avec navigateur ET rclone (ex. rclone.exe sous
+#     Windows). Colle le JSON entier sur la ligne `token =`.
+
+[gphotos]
+type = google photos
+client_id = XXXX
+client_secret = YYYY
+token = {}

@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Lance le conteneur de prod convert-h265 (ré-encodage HEVC via NVENC).
+# CINÉ — nettoyage des noms + conversion HEVC (NVENC) du NAS (movies/tvshows…).
+# Lance le service compose convert-h265 (src/cine-videos : 01-clean-names.py
+# puis 02-convert-to-h265.py).
+#
 # Réglages dans env/.env (NAS_MOUNT, INPUT_FOLDERS, CQ, PRESET, DRY_RUN).
 # DRY_RUN : true = simulation (aucun renommage ni conversion), false = réel.
 # Défaut false (comportement historique). Deux façons de le régler :
-#   ./run-convert-h265.sh --DRY_RUN=true       (flag, prioritaire)
-#   DRY_RUN=true ./run-convert-h265.sh         (variable d'env)
+#   ./run-cine-pipeline.sh --DRY_RUN=true       (flag, prioritaire)
+#   DRY_RUN=true ./run-cine-pipeline.sh         (variable d'env)
 # Les autres arguments sont transmis tels quels à `docker compose up`
-#   ex: ./run-convert-h265.sh --DRY_RUN=true -d   (en arrière-plan)
+#   ex: ./run-cine-pipeline.sh --DRY_RUN=true -d   (en arrière-plan)
 set -euo pipefail
 
 # Valeur initiale depuis l'env (ou défaut historique), surchargée par --DRY_RUN=.
@@ -26,7 +29,5 @@ export DRY_RUN
 
 cd "$(dirname "$0")"
 
-# Service explicite : depuis l'ajout de `compress-gphotos`, un `up` sans nom
-# de service les lancerait tous les deux. On ne démarre que convert-h265.
 docker compose --env-file env/.env up --build --no-log-prefix \
   "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}" convert-h265
