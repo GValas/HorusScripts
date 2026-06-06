@@ -12,11 +12,20 @@ FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
 # tzdata : sans lui, le conteneur tourne en UTC et les logs sont décalés de 2h
 # par rapport à Paris (CEST). TZ ci-dessous fixe le fuseau utilisé par Python.
 # python3-pip : requis pour installer Pillow (compress-for-gphotos).
-# rclone : upload vers Google Photos (04-upload-to-gphotos.sh).
+# curl/unzip/ca-certificates : pour installer rclone depuis le binaire officiel
+# (cf. ci-dessous) — PAS le paquet apt.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg python3 python3-pip tzdata rclone \
+        ffmpeg python3 python3-pip tzdata ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# rclone : upload vers Google Photos (04-upload-to-gphotos.sh).
+# On installe le binaire officiel (dernière version stable) et NON le paquet apt
+# d'Ubuntu 24.04, figé en v1.60 — trop ancien : il lui manque le mode batch
+# Google Photos (--gphotos-batch-mode), qui regroupe jusqu'à 50 créations de
+# médias par appel API au lieu d'un appel batchCreate lent par fichier. Sans lui
+# l'upload plafonne à ~1 fichier / 10 s. install.sh récupère la dernière stable.
+RUN curl -fsSL https://rclone.org/install.sh | bash
 
 # Dépendances Python du pipeline perso :
 #   - Pillow : redimensionnement / ré-encodage des photos (03)

@@ -110,5 +110,13 @@ COMPRESS_VIDEO_HEIGHT = 720     # hauteur max des vidéos (px) ; qualité = VIDE
 # ══════════════════════════════════════════════════════════════════════════════
 
 UPLOAD_REMOTE = "gphotos"   # nom du remote rclone (défini dans env/rclone.conf)
-UPLOAD_TRANSFERS = 4        # uploads parallèles (rclone --transfers)
-UPLOAD_TPSLIMIT = 10        # plafond de requêtes/s vers l'API (rclone --tpslimit)
+UPLOAD_TRANSFERS = 8        # uploads parallèles (rclone --transfers) ; gain principal
+UPLOAD_TPSLIMIT = 15        # plafond de requêtes/s vers l'API (rclone --tpslimit) ;
+#   au-delà de ~15-20, Google renvoie des 429 (rate limit) -> rclone back-off,
+#   souvent plus lent. La vraie limite est le quota Google Photos
+#   (~10 000 requêtes API/jour par projet OAuth) + le throttling serveur.
+UPLOAD_BATCH_MODE = "sync"  # rclone --gphotos-batch-mode : regroupe jusqu'à 50
+#   créations de médias par appel API au lieu d'un batchCreate (lent) par fichier
+#   -> upload bien plus rapide. "sync" (sûr, erreurs remontées par fichier),
+#   "async" (plus rapide, erreurs différées), "off" (ancien comportement 1/1).
+#   Nécessite rclone >= 1.63 (cf. Dockerfile : binaire officiel, pas le paquet apt).

@@ -78,8 +78,11 @@ for step in "${STEPS[@]}"; do
     03) run_step "03 compress-for-gphotos"
         "${BASE[@]}" "${GPU[@]}" -v "$OUT:/output" "$IMAGE" python3 "03-compress-for-gphotos.py" ;;
     04) run_step "04 upload-to-gphotos (rclone)"
-        "${BASE[@]}" -v "$OUT:/output:ro" -v "$RCLONE_CONF:/cfg/rclone.conf" \
-          -e RCLONE_CONFIG=/cfg/rclone.conf "$IMAGE" bash "04-upload-to-gphotos.sh" ;;
+        # --entrypoint bash : on court-circuite l'entrypoint de l'image nvidia/cuda
+        # (bannière CUDA + « NVIDIA Driver was not detected »). 04 n'utilise pas le
+        # GPU, ce check est un faux positif ici.
+        "${BASE[@]}" --entrypoint bash -v "$OUT:/output:ro" -v "$RCLONE_CONF:/cfg/rclone.conf" \
+          -e RCLONE_CONFIG=/cfg/rclone.conf "$IMAGE" "04-upload-to-gphotos.sh" ;;
   esac
 done
 

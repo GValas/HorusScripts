@@ -35,8 +35,22 @@ DRY_RUN="$(read_cfg DRY_RUN)"
 REMOTE="$(read_cfg UPLOAD_REMOTE)"
 TRANSFERS="$(read_cfg UPLOAD_TRANSFERS)"
 TPSLIMIT="$(read_cfg UPLOAD_TPSLIMIT)"
+BATCH_MODE="$(read_cfg UPLOAD_BATCH_MODE)"
 RCLONE_DRY=""
 [ "$DRY_RUN" = "True" ] && RCLONE_DRY="--dry-run"
+
+# ── Config inscriptible ───────────────────────────────────────────────────────
+# rclone rafraîchit le jeton OAuth (l'access token Google expire ~1 h) puis veut
+# réécrire rclone.conf. Le launcher monte le fichier seul dans /cfg/ (dossier
+# root) et le conteneur tourne en --user non-root : impossible d'y créer le
+# fichier temporaire -> « permission denied ». On travaille donc sur une COPIE
+# inscriptible. Le refresh token sur l'hôte reste valable : rien n'est perdu.
+if [ -n "${RCLONE_CONFIG:-}" ] && [ -f "${RCLONE_CONFIG}" ]; then
+  WRITABLE_CONF="$(mktemp)"
+  cp "${RCLONE_CONFIG}" "${WRITABLE_CONF}"
+  export RCLONE_CONFIG="${WRITABLE_CONF}"
+  trap 'rm -f "${WRITABLE_CONF}"' EXIT
+fi
 
 # ── Vérifications ─────────────────────────────────────────────────────────────
 command -v rclone >/dev/null 2>&1 || {
@@ -64,7 +78,8 @@ for d in "$SRC"/*/; do
   echo "── Album : $album ──"
   rclone copy "$d" "${REMOTE}:album/${album}" \
     $RCLONE_DRY --stats 30s --stats-one-line \
-    --transfers "$TRANSFERS" --tpslimit "$TPSLIMIT" "$@"
+    --transfers "$TRANSFERS" --tpslimit "$TPSLIMIT" \
+    --gphotos-batch-mode "$BATCH_MODE" "$@"
   count=$((count + 1))
 done
 
