@@ -3,7 +3,7 @@
 # UTILISATION :
 #   1) cp env/rclone.conf.example env/rclone.conf   (env/rclone.conf est gitignoré)
 #   2) Remplir client_id / client_secret / token (voir ci-dessous).
-#   run-perso-pipeline.sh (étape 04) monte env/rclone.conf en /cfg/rclone.conf
+#   run-perso-media-pipeline.sh (étape 04) monte env/rclone.conf en /cfg/rclone.conf
 #   (RCLONE_CONFIG) ; le token est rafraîchi en mémoire à chaque run.
 #
 # OÙ TROUVER LES VALEURS :

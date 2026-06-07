@@ -4,10 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
     image: horus-convert-h265
-    # Tous les réglages viennent de src/cine-videos/00-config.py (monté en LIVE
+    # Tous les réglages viennent de src/public-media/00-config.py (monté en LIVE
     # ci-dessous), lu par les scripts via importlib — plus d'env_file ni de
     # variables d'environnement. NAS_MOUNT (pour le volume ci-dessous) est
-    # exporté par run-cine-pipeline.sh, qui le lit dans 00-config.py.
+    # exporté par run-public-media-pipeline.sh, qui le lit dans 00-config.py.
     # Accès GPU NVIDIA pour NVENC (hevc_nvenc).
     # Nécessite nvidia-container-toolkit installé et configuré sur l'hôte.
     deploy:
@@ -23,7 +23,7 @@ services:
       - ${NAS_MOUNT}:${NAS_MOUNT}
       # Scripts + 00-config.py montés en LIVE (comme le pipeline perso) : éditer
       # la config prend effet sans rebuild.
-      - ./src/cine-videos:/work
+      - ./src/public-media:/work
     working_dir: /work
     # On nettoie d'abord les noms (renommage), puis on convertit en HEVC.
     # Les deux scripts partagent INPUT_FOLDERS / DRY_RUN (via 00-config.py).
@@ -32,5 +32,5 @@ services:
     restart: "no"
 
   # Le pipeline perso (01->04) ne passe PAS par docker-compose : il est lancé
-  # par run-perso-pipeline.sh, qui orchestre les 4 étapes en `docker run` (mêmes
+  # par run-perso-media-pipeline.sh, qui orchestre les 4 étapes en `docker run` (mêmes
   # image et réglages 00-config.py). Aucun service compose perso ici.

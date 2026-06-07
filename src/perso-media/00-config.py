@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-00-config.py — Paramètres centralisés du pipeline perso-photo-videos.
+00-config.py — Paramètres centralisés du pipeline perso-media.
 
 Tout se règle ici, en variables Python (aucune variable d'environnement) :
   - un bloc COMMUN partagé par plusieurs scripts (DRY_RUN, extensions cibles,
@@ -26,7 +26,9 @@ from pathlib import Path
 # Racine du share photos du NAS, scannée par 01/02/03. En container/local :
 # /mnt/wsl/horus/photos (cf. CLAUDE.md : utiliser /mnt/wsl/horus, JAMAIS
 # /mnt/horus, invisible des conteneurs).
-NAS_PHOTOS = "/mnt/wsl/horus/photos"
+# Astuce : pour traiter un dossier Windows, pointer sur son chemin WSL
+# (ex. "/mnt/c/Users/.../photos-a-trier") — Docker Desktop partage les disques C:.
+PHOTOS_SRC = "/mnt/wsl/horus/photos"
 
 # Dossier du projet (…/HorusScripts), déduit de l'emplacement de ce fichier —
 # sert à construire le chemin de sortie de 03 (output/gphotos).
@@ -103,7 +105,7 @@ COMPRESS_VIDEO_HEIGHT = 720     # hauteur max des vidéos (px) ; qualité = VIDE
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 04 — upload-to-gphotos (rclone)
-#   Upload via rclone : src/perso-photo-videos/04-upload-to-gphotos.sh
+#   Upload via rclone : src/perso-media/04-upload-to-gphotos.sh
 #   (1 dossier de niveau 1 = 1 album). Le script lit ces réglages + DRY_RUN.
 #   L'authentification (client OAuth + jeton) est dans env/rclone.conf
 #   (gitignoré, hors de ce fichier). L'ancien script Python est archivé/.

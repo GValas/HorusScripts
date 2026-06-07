@@ -8,8 +8,8 @@ piexif, rclone).
 
 | Pipeline | Dossier | Lanceur | Rôle |
 |---|---|---|---|
-| **Ciné** | [`src/cine-videos/`](src/cine-videos/) | [`run-cine-pipeline.sh`](run-cine-pipeline.sh) | Nettoie les noms + ré-encode films/séries en HEVC |
-| **Perso** | [`src/perso-photo-videos/`](src/perso-photo-videos/) | [`run-perso-pipeline.sh`](run-perso-pipeline.sh) | Photos/vidéos perso : normalise → date → compresse → upload Google Photos |
+| **Public** | [`src/public-media/`](src/public-media/) | [`run-public-media-pipeline.sh`](run-public-media-pipeline.sh) | Nettoie les noms + ré-encode films/séries en HEVC |
+| **Perso** | [`src/perso-media/`](src/perso-media/) | [`run-perso-media-pipeline.sh`](run-perso-media-pipeline.sh) | Photos/vidéos perso : normalise → date → compresse → upload Google Photos |
 
 > ⚠️ Le NAS doit toujours être adressé via **`/mnt/wsl/horus`**, jamais
 > `/mnt/horus` (sinon les conteneurs voient des dossiers vides — cf. la section
@@ -17,52 +17,52 @@ piexif, rclone).
 
 ---
 
-## Pipeline ciné — `src/cine-videos/`
+## Pipeline public — `src/public-media/`
 
 Deux scripts enchaînés sur les mêmes dossiers (`INPUT_FOLDERS`) :
 
-1. [`01-clean-names`](src/cine-videos/01-clean-names.py) — nettoie les noms de
+1. [`01-clean-names`](src/public-media/01-clean-names.py) — nettoie les noms de
    dossiers/fichiers (retire `1080p`, `x264`…, normalise casse et séparateurs, met
    l'année entre parenthèses), avec détection de collisions.
-2. [`02-convert-to-h265`](src/cine-videos/02-convert-to-h265.py) — ré-encode
+2. [`02-convert-to-h265`](src/public-media/02-convert-to-h265.py) — ré-encode
    récursivement tout ce qui n'est pas déjà en HEVC vers x265 via **NVENC** (GPU
    NVIDIA), conserve toutes les pistes audio/sous-titres, puis **remplace
    l'original** après vérification du nombre de pistes.
 
-Réglages centralisés dans [`src/cine-videos/00-config.py`](src/cine-videos/00-config.py)
+Réglages centralisés dans [`src/public-media/00-config.py`](src/public-media/00-config.py)
 (`NAS_MOUNT`, `INPUT_FOLDERS`, `DRY_RUN`, `CLEAN_*`, `CONVERT_*`), partagés par
 les deux scripts — même principe que le pipeline perso, plus d'`env/.env`. Lancement :
 
 ```bash
-./run-cine-pipeline.sh        # demande confirmation si DRY_RUN=False
-./run-cine-pipeline.sh -y     # sans confirmation
+./run-public-media-pipeline.sh        # demande confirmation si DRY_RUN=False
+./run-public-media-pipeline.sh -y     # sans confirmation
 # Tout autre argument est transmis à `docker compose up` (ex: -d).
 ```
 
 ---
 
-## Pipeline perso — `src/perso-photo-videos/`
+## Pipeline perso — `src/perso-media/`
 
 Quatre étapes numérotées, **toutes réglées depuis un seul fichier**,
-[`00-config.py`](src/perso-photo-videos/00-config.py) (aucune variable d'env). Il
+[`00-config.py`](src/perso-media/00-config.py) (aucune variable d'env). Il
 contient un bloc COMMUN (un `DRY_RUN` unique, `PHOTO_EXT=.jpg`, `VIDEO_EXT=.mkv`,
 réglages NVENC, racine NAS, bornes d'années) puis un bloc par étape.
 
 Chaque étape parcourt le partage `photos` et **ignore les dossiers commençant par
 `_`** :
 
-1. [`01-convert-to-mkv+h265`](src/perso-photo-videos/01-convert-to-mkv+h265.py) —
+1. [`01-convert-to-mkv+h265`](src/perso-media/01-convert-to-mkv+h265.py) —
    **normalisation de format uniquement** : toute vidéo finit en **H.265 + MKV**
    quel que soit le codec/conteneur d'origine (NVENC obligatoire) ; `.jpeg`→`.jpg`.
    Conserve les tags de date existants mais **n'en infère pas** (c'est le rôle de 02).
-2. [`02-enrich-movies-photos-with-date`](src/perso-photo-videos/02-enrich-movies-photos-with-date.py) —
+2. [`02-enrich-movies-photos-with-date`](src/perso-media/02-enrich-movies-photos-with-date.py) —
    **inférence des dates** manquantes, par priorité : tag existant → nom de fichier
    (`YYYYMMDD_HHMMSS`, `2022-06-19 at 21.59.44`…) → photo voisine du même dossier →
    dossier parent `YY.MM` → date de modification du fichier.
-3. [`03-compress-for-gphotos`](src/perso-photo-videos/03-compress-for-gphotos.py) —
+3. [`03-compress-for-gphotos`](src/perso-media/03-compress-for-gphotos.py) —
    écrit une **copie compressée** dans `output/gphotos` (photos redimensionnées,
    vidéos ré-encodées 720p). Ne produit que `.jpg` + `.mkv`.
-4. [`04-upload-to-gphotos.sh`](src/perso-photo-videos/04-upload-to-gphotos.sh) —
+4. [`04-upload-to-gphotos.sh`](src/perso-media/04-upload-to-gphotos.sh) —
    **upload via rclone** de `output/gphotos` vers Google Photos ; chaque dossier de
    premier niveau devient un album du même nom. Auth dans `env/rclone.conf`
    (gitignoré, cf. Configuration).
@@ -72,9 +72,9 @@ prend effet sans rebuild ; lance le conteneur en `--user` pour que les fichiers
 produits t'appartiennent) :
 
 ```bash
-./run-perso-pipeline.sh            # toutes les étapes ; confirme si DRY_RUN=False
-./run-perso-pipeline.sh -y         # sans confirmation
-./run-perso-pipeline.sh 03 04      # un sous-ensemble d'étapes seulement
+./run-perso-media-pipeline.sh            # toutes les étapes ; confirme si DRY_RUN=False
+./run-perso-media-pipeline.sh -y         # sans confirmation
+./run-perso-media-pipeline.sh 03 04      # un sous-ensemble d'étapes seulement
 ```
 
 ---
@@ -160,7 +160,7 @@ relancer Ubuntu.
 
 ## Configuration
 
-### Ciné — `src/cine-videos/00-config.py`
+### Public — `src/public-media/00-config.py`
 
 Tous les réglages sont des variables Python dans ce fichier (pas d'env), chargé
 par les deux scripts via `importlib` — même principe que le pipeline perso.
@@ -180,7 +180,7 @@ par les deux scripts via `importlib` — même principe que le pipeline perso.
 `NAS_MOUNT` est aussi consommé par `docker compose` pour le mapping de volume :
 le lanceur le lit dans `00-config.py` et l'exporte avant `docker compose up`.
 
-### Perso — `src/perso-photo-videos/00-config.py`
+### Perso — `src/perso-media/00-config.py`
 
 Tous les réglages sont des variables Python dans ce fichier (pas d'env). Le plus
 important : `DRY_RUN` (commun aux 4 étapes, **défaut `True` = simulation**). Le
@@ -207,7 +207,7 @@ ni commités** (seul le `.example` à placeholders est versionné).
 3. Lancer un script depuis le terminal intégré, ex. :
 
 ```bash
-python src/cine-videos/02-convert-to-h265.py
+python src/public-media/02-convert-to-h265.py
 ```
 
 ---
@@ -216,14 +216,14 @@ python src/cine-videos/02-convert-to-h265.py
 
 ```
 HorusScripts/
-├── run-cine-pipeline.sh           # Lanceur ciné (docker compose)
-├── run-perso-pipeline.sh          # Lanceur perso (orchestre 01→04 en docker run)
+├── run-public-media-pipeline.sh           # Lanceur public (docker compose)
+├── run-perso-media-pipeline.sh          # Lanceur perso (orchestre 01→04 en docker run)
 ├── src/
-│   ├── cine-videos/
+│   ├── public-media/
 │   │   ├── 00-config.py            # Réglages centralisés des 2 scripts
 │   │   ├── 01-clean-names.py       # Renommage (avant conversion)
 │   │   └── 02-convert-to-h265.py   # Ré-encodage NVENC HEVC
-│   ├── perso-photo-videos/
+│   ├── perso-media/
 │   │   ├── 00-config.py            # Réglages centralisés des 4 étapes
 │   │   ├── 01-convert-to-mkv+h265.py
 │   │   ├── 02-enrich-movies-photos-with-date.py
@@ -234,7 +234,7 @@ HorusScripts/
 │   └── rclone.conf / .example      # Auth Google Photos (rclone.conf gitignored)
 ├── .devcontainer/                  # Dev container VS Code
 ├── Dockerfile                      # Image unique horus-convert-h265 (CUDA + ffmpeg + Pillow/piexif/rclone)
-├── docker-compose.yml              # Service convert-h265 (ciné)
+├── docker-compose.yml              # Service convert-h265 (public)
 ├── requirements.txt                # Vide (dépendances dans l'image Docker)
 └── README.md
 ```

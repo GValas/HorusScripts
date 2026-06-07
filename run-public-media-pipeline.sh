@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# CINÉ — nettoyage des noms + conversion HEVC (NVENC) du NAS (movies/tvshows…).
-# Lance le service compose convert-h265 (src/cine-videos : 01-clean-names.py
+# PUBLIC — nettoyage des noms + conversion HEVC (NVENC) du NAS (movies/tvshows…).
+# Lance le service compose convert-h265 (src/public-media : 01-clean-names.py
 # puis 02-convert-to-h265.py).
 #
-# TOUS les réglages sont dans src/cine-videos/00-config.py (NAS_MOUNT,
+# TOUS les réglages sont dans src/public-media/00-config.py (NAS_MOUNT,
 # INPUT_FOLDERS, DRY_RUN, CLEAN_*, CONVERT_*) — comme le pipeline perso. Plus
 # de variables d'environnement ni d'env/.env.
 #   DRY_RUN : True = simulation (aucun renommage ni conversion), False = réel
 #             (02 SUPPRIME les originaux après conversion).
 #
 # Usage :
-#   ./run-cine-pipeline.sh        # demande confirmation si DRY_RUN=False
-#   ./run-cine-pipeline.sh -y     # sans confirmation
-#   ./run-cine-pipeline.sh -d     # args supplémentaires transmis à compose (ex: -d)
+#   ./run-public-media-pipeline.sh        # demande confirmation si DRY_RUN=False
+#   ./run-public-media-pipeline.sh -y     # sans confirmation
+#   ./run-public-media-pipeline.sh -d     # args supplémentaires transmis à compose (ex: -d)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-CONFIG="src/cine-videos/00-config.py"
+CONFIG="src/public-media/00-config.py"
 read_cfg() {
   python3 -c "import importlib.util,pathlib; \
 s=importlib.util.spec_from_file_location('c', pathlib.Path('${CONFIG}')); \
@@ -39,7 +39,7 @@ for arg in "$@"; do
 done
 
 echo "════════════════════════════════════════════════════════════"
-echo " Pipeline cine-videos (clean-names -> convert-h265)"
+echo " Pipeline public-media (clean-names -> convert-h265)"
 echo "   NAS    : $NAS_MOUNT"
 echo "   Mode   : $([ "$DRY_RUN" = "True" ] && echo 'DRY RUN (simulation)' || echo '*** EXÉCUTION RÉELLE ***')"
 echo "════════════════════════════════════════════════════════════"

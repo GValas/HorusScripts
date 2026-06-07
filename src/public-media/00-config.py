@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-00-config.py — Paramètres centralisés du pipeline ciné (cine-videos).
+00-config.py — Paramètres centralisés du pipeline public (public-media).
 
 Tout se règle ici, en variables Python (plus aucune variable d'environnement
 ni env/.env), exactement comme le pipeline perso :
@@ -12,7 +12,7 @@ ni env/.env), exactement comme le pipeline perso :
 
 Les deux scripts chargent ce fichier via importlib (le nom « 00-config.py »,
 avec chiffres et tiret, n'est pas importable directement) ; le lanceur
-run-cine-pipeline.sh lit NAS_MOUNT / DRY_RUN via un petit appel python3.
+run-public-media-pipeline.sh lit NAS_MOUNT / DRY_RUN via un petit appel python3.
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -38,7 +38,7 @@ INPUT_FOLDERS = [
 #   True  = simulation (aucun renommage ni conversion, rien d'écrit/supprimé) ;
 #   False = exécution réelle — ATTENTION : 02 SUPPRIME les originaux après
 #           conversion réussie.
-DRY_RUN = True
+DRY_RUN = False
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 01 — clean-names

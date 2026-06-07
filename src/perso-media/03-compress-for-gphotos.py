@@ -45,7 +45,7 @@ _spec = importlib.util.spec_from_file_location(
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-SOURCE = config.NAS_PHOTOS
+SOURCE = config.PHOTOS_SRC
 OUTPUT = config.COMPRESS_OUTPUT
 DRY_RUN = config.DRY_RUN
 MAX_PHOTO_SIZE = config.COMPRESS_MAX_PHOTO_SIZE

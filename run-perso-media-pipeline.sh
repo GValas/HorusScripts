@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Pipeline complet perso-photo-videos : enchaîne 01 -> 02 -> 03 -> 04 dans le
+# Pipeline complet perso-media : enchaîne 01 -> 02 -> 03 -> 04 dans le
 # conteneur. Arrêt à la PREMIÈRE erreur (set -e).
 #
 # Tous les réglages (dont DRY_RUN commun) sont dans
-# src/perso-photo-videos/00-config.py — monté en LIVE, donc pris en compte sans
+# src/perso-media/00-config.py — monté en LIVE, donc pris en compte sans
 # rebuild. Les fichiers produits t'appartiennent (--user).
 #
 # Étapes :
@@ -13,18 +13,33 @@
 #   04 upload   : output/gphotos -> Google Photos (rclone)          [output ro, rclone.conf]
 #
 # Usage :
-#   ./run-perso-pipeline.sh           # demande confirmation si DRY_RUN=False
-#   ./run-perso-pipeline.sh -y        # sans confirmation
-#   ./run-perso-pipeline.sh 03 04     # ne lance que ces étapes (sous-ensemble)
+#   ./run-perso-media-pipeline.sh           # demande confirmation si DRY_RUN=False
+#   ./run-perso-media-pipeline.sh -y        # sans confirmation
+#   ./run-perso-media-pipeline.sh 03 04     # ne lance que ces étapes (sous-ensemble)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 IMAGE="horus-convert-h265"
-NAS="/mnt/wsl/horus"
-SRC="$PWD/src/perso-photo-videos"
-OUT="$PWD/output"
+SCRIPTS_DIR="$PWD/src/perso-media"
 RCLONE_CONF="$PWD/env/rclone.conf"
 USERSPEC="$(id -u):$(id -g)"
+
+# Tous les réglages viennent de 00-config.py (source de vérité commune).
+read_cfg() {
+  python3 -c "import importlib.util,pathlib; \
+s=importlib.util.spec_from_file_location('c', pathlib.Path('${SCRIPTS_DIR}/00-config.py')); \
+m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(getattr(m, '$1'))"
+}
+
+# Racine scannée par 01/02/03 : le NAS (/mnt/wsl/horus/photos) OU un dossier
+# Windows (ex. /mnt/c/Users/.../photos-a-trier — Docker Desktop partage les
+# disques C:). On la lit dans la config et on la monte telle quelle.
+PHOTOS_SRC="$(read_cfg PHOTOS_SRC)"
+
+# Dossier de sortie gphotos : SEULE source de vérité = COMPRESS_OUTPUT (00-config).
+# Le lanceur tourne sur l'hôte -> chemin hôte absolu (= $PWD/output/gphotos) ;
+# monté tel quel sur /output/gphotos (= COMPRESS_OUTPUT côté conteneur).
+OUT="$(read_cfg COMPRESS_OUTPUT)"
 
 # Étapes demandées (défaut : toutes).
 ASSUME_YES=0
@@ -38,13 +53,10 @@ for a in "$@"; do
 done
 [ ${#STEPS[@]} -eq 0 ] && STEPS=(01 02 03 04)
 
-# Lit DRY_RUN depuis 00-config.py (source de vérité commune).
-DRY_RUN=$(python3 -c "import importlib.util,pathlib; \
-s=importlib.util.spec_from_file_location('c', pathlib.Path('${SRC}/00-config.py')); \
-m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.DRY_RUN)")
+DRY_RUN="$(read_cfg DRY_RUN)"
 
 echo "════════════════════════════════════════════════════════════"
-echo " Pipeline perso-photo-videos"
+echo " Pipeline perso-media"
 echo "   Étapes : ${STEPS[*]}"
 echo "   Mode   : $([ "$DRY_RUN" = "True" ] && echo 'DRY RUN (simulation)' || echo '*** EXÉCUTION RÉELLE ***')"
 echo "════════════════════════════════════════════════════════════"
@@ -62,7 +74,7 @@ if [ "$DRY_RUN" != "True" ] && [ "$ASSUME_YES" -ne 1 ]; then
 fi
 
 # Bases de lancement docker communes.
-BASE=(docker run --rm --user "$USERSPEC" -v "$NAS:$NAS" -v "$SRC:/work" -w /work)
+BASE=(docker run --rm --user "$USERSPEC" -v "$PHOTOS_SRC:$PHOTOS_SRC" -v "$SCRIPTS_DIR:/work" -w /work)
 GPU=(--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all)
 
 run_step() {  # $1 = libellé
@@ -76,12 +88,12 @@ for step in "${STEPS[@]}"; do
     02) run_step "02 enrich-movies-photos-with-date"
         "${BASE[@]}" "$IMAGE" python3 "02-enrich-movies-photos-with-date.py" ;;
     03) run_step "03 compress-for-gphotos"
-        "${BASE[@]}" "${GPU[@]}" -v "$OUT:/output" "$IMAGE" python3 "03-compress-for-gphotos.py" ;;
+        "${BASE[@]}" "${GPU[@]}" -v "$OUT:/output/gphotos" "$IMAGE" python3 "03-compress-for-gphotos.py" ;;
     04) run_step "04 upload-to-gphotos (rclone)"
         # --entrypoint bash : on court-circuite l'entrypoint de l'image nvidia/cuda
         # (bannière CUDA + « NVIDIA Driver was not detected »). 04 n'utilise pas le
         # GPU, ce check est un faux positif ici.
-        "${BASE[@]}" --entrypoint bash -v "$OUT:/output:ro" -v "$RCLONE_CONF:/cfg/rclone.conf" \
+        "${BASE[@]}" --entrypoint bash -v "$OUT:/output/gphotos:ro" -v "$RCLONE_CONF:/cfg/rclone.conf" \
           -e RCLONE_CONFIG=/cfg/rclone.conf "$IMAGE" "04-upload-to-gphotos.sh" ;;
   esac
 done

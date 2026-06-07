@@ -4,7 +4,7 @@
 # Les ffmpeg/ffprobe d'Ubuntu 24.04 sont compilés avec le support NVENC ; les
 # libs propriétaires (libnvidia-encode) sont injectées au runtime par
 # nvidia-container-toolkit lorsqu'on lance le conteneur avec accès GPU.
-# Ubuntu 24.04 fournit Python 3.12. Les scripts cine n'ont aucune dépendance
+# Ubuntu 24.04 fournit Python 3.12. Les scripts public n'ont aucune dépendance
 # PyPI (stdlib + binaires ffmpeg/ffprobe) ; le pipeline perso ajoute Pillow (03)
 # et piexif (02), et rclone pour l'upload (04) — installés plus bas.
 FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
@@ -38,21 +38,21 @@ RUN pip install --no-cache-dir --break-system-packages Pillow piexif
 ENV TZ=Europe/Paris
 
 WORKDIR /app
-# Les scripts ciné (01/02 + 00-config.py) ne sont PAS copiés ici : le lanceur
-# run-cine-pipeline.sh les monte en LIVE dans /work via docker-compose (comme le
+# Les scripts public (01/02 + 00-config.py) ne sont PAS copiés ici : le lanceur
+# run-public-media-pipeline.sh les monte en LIVE dans /work via docker-compose (comme le
 # pipeline perso). Les y baker collisionnerait d'ailleurs avec le 00-config.py
 # perso ci-dessous (même cible /app/00-config.py) et chargerait la mauvaise config.
 # 00-config.py doit être à côté des scripts perso (chargé via Path(__file__)).
-COPY src/perso-photo-videos/00-config.py ./00-config.py
-COPY src/perso-photo-videos/03-compress-for-gphotos.py ./03-compress-for-gphotos.py
+COPY src/perso-media/00-config.py ./00-config.py
+COPY src/perso-media/03-compress-for-gphotos.py ./03-compress-for-gphotos.py
 # Upload Google Photos via rclone (lit 00-config.py à côté pour SRC/DRY_RUN).
-COPY src/perso-photo-videos/04-upload-to-gphotos.sh ./04-upload-to-gphotos.sh
+COPY src/perso-media/04-upload-to-gphotos.sh ./04-upload-to-gphotos.sh
 
 # Logs en direct (docker compose logs -f), sans bufferisation
 ENV PYTHONUNBUFFERED=1
 
-# Pas de CMD « métier » par défaut : l'image embarque plusieurs scripts (cine :
+# Pas de CMD « métier » par défaut : l'image embarque plusieurs scripts (public :
 # clean-names + convert-h265 ; perso : 01->04). Chaque lanceur fournit sa propre
-# commande (run-cine-pipeline.sh via compose ; run-perso-pipeline.sh via docker
+# commande (run-public-media-pipeline.sh via compose ; run-perso-media-pipeline.sh via docker
 # run). Ce CMD neutre évite de lancer silencieusement un workflow.
-CMD ["sh", "-c", "echo 'Image utilitaire — lance run-cine-pipeline.sh ou run-perso-pipeline.sh' >&2; exit 1"]
+CMD ["sh", "-c", "echo 'Image utilitaire — lance run-public-media-pipeline.sh ou run-perso-media-pipeline.sh' >&2; exit 1"]

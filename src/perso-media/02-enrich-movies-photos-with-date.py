@@ -61,7 +61,7 @@ _spec = importlib.util.spec_from_file_location(
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-SOURCE       = config.NAS_PHOTOS
+SOURCE       = config.PHOTOS_SRC
 EXPORT_CSV   = config.ENRICH_EXPORT_CSV
 EXPORT_JSON  = config.ENRICH_EXPORT_JSON
 DRY_RUN      = config.DRY_RUN

@@ -18,7 +18,7 @@
     "source=/mnt/wsl/horus/tvshows,target=/mnt/horus/tvshows,type=bind",
     "source=/mnt/wsl/horus/cartoons,target=/mnt/horus/cartoons,type=bind"
   ],
-  // Accès au GPU NVIDIA (encodage NVENC de src/cine-videos/convert-h265.py).
+  // Accès au GPU NVIDIA (encodage NVENC de src/public-media/convert-h265.py).
   // Sous WSL2, le NVIDIA Container Toolkit injecte le driver CUDA/NVENC du host
   // Windows dans le conteneur. Prérequis HOST (non gérables ici) :
   //   1. GPU NVIDIA + driver Windows récent avec support WSL ;

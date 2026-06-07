@@ -38,7 +38,7 @@ _spec = importlib.util.spec_from_file_location(
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-SOURCE_DIR    = Path(config.NAS_PHOTOS)
+SOURCE_DIR    = Path(config.PHOTOS_SRC)
 DRY_RUN       = config.DRY_RUN
 RENAME_JPEG   = config.CONVERT_RENAME_JPEG
 EXTENSIONS    = config.CONVERT_EXTENSIONS
@@ -467,8 +467,20 @@ def main():
             # Pour un autre conteneur, l'original est distinct de la sortie :
             # on le supprime. Pour l'in-place, os.replace l'a déjà remplacé.
             if not in_place:
-                input_file.unlink()
-                logger.info("    🗑  Original supprimé : %s", input_file.name)
+                try:
+                    input_file.unlink()
+                    logger.info("    🗑  Original supprimé : %s", input_file.name)
+                except OSError as e:
+                    # Sur /mnt/c (Windows), un fichier peut être verrouillé
+                    # (Explorateur, aperçu, antivirus) -> suppression refusée. Le
+                    # MKV est déjà créé : on garde l'original en doublon et on
+                    # CONTINUE (au prochain run, la cible .mkv existante fera
+                    # sauter ce fichier). Ne jamais planter tout le pipeline pour ça.
+                    logger.warning(
+                        "    ⚠️  Original NON supprimé (verrou/permission ?) : %s — %s",
+                        input_file.name,
+                        e,
+                    )
             ext_stats[ext]["converted"]           += 1
             codec_stats[codec_label]["converted"] += 1
             if action == "encode":

@@ -3,8 +3,8 @@
 #   - 1 dossier de 1er niveau de output/gphotos = 1 album du même nom
 #     (tout le contenu du dossier, sous-dossiers inclus, va dans cet album).
 #   - S'exécute normalement DANS le conteneur (rclone y est installé) via
-#     run-perso-pipeline.sh. Remplace l'ancien 04-upload-to-gphotos.py (archivé
-#     sous src/perso-photo-videos/archive/).
+#     run-perso-media-pipeline.sh. Remplace l'ancien 04-upload-to-gphotos.py (archivé
+#     sous src/perso-media/archive/).
 #
 # ── PRÉREQUIS (une seule fois) ────────────────────────────────────────────────
 #   cp env/rclone.conf.example env/rclone.conf  puis remplir client_id /
@@ -12,7 +12,7 @@
 #   `rclone authorize "google photos"` sur une machine avec navigateur + rclone
 #   (ex. rclone.exe sous Windows). Aucune install rclone requise sur l'hôte.
 #
-# ── RÉGLAGES (tous dans src/perso-photo-videos/00-config.py) ──────────────────
+# ── RÉGLAGES (tous dans src/perso-media/00-config.py) ──────────────────
 #   DRY_RUN (commun)  : True -> rclone --dry-run (simulation) ; False -> réel.
 #   UPLOAD_REMOTE / UPLOAD_TRANSFERS / UPLOAD_TPSLIMIT ; source = COMPRESS_OUTPUT.
 # Arguments additionnels transmis tels quels à rclone (ex. -v).
