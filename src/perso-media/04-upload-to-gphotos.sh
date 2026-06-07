@@ -86,4 +86,8 @@ done
 
 echo "========================================================================"
 echo "Terminé — $count album(s) traité(s)."
-[ -n "$RCLONE_DRY" ] && echo "(DRY RUN : passe DRY_RUN=False dans ${CONFIG} pour envoyer réellement.)"
+# NB : un `[ -n "$X" ] && echo` en DERNIÈRE ligne ferait sortir le script en
+# erreur quand X est vide (mode réel) sous `set -e` -> faux échec. D'où le `if`.
+if [ -n "$RCLONE_DRY" ]; then
+  echo "(DRY RUN : passe DRY_RUN=False dans ${CONFIG} pour envoyer réellement.)"
+fi

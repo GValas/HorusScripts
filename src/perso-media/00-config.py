@@ -28,7 +28,7 @@ from pathlib import Path
 # /mnt/horus, invisible des conteneurs).
 # Astuce : pour traiter un dossier Windows, pointer sur son chemin WSL
 # (ex. "/mnt/c/Users/.../photos-a-trier") — Docker Desktop partage les disques C:.
-PHOTOS_SRC = "/mnt/wsl/horus/photos"
+PHOTOS_SRC = "/mnt/c/Users/valas/Downloads/photos-a-trier"
 
 # Dossier du projet (…/HorusScripts), déduit de l'emplacement de ce fichier —
 # sert à construire le chemin de sortie de 03 (output/gphotos).

@@ -10,6 +10,7 @@ venv/
 env/rclone.conf
 
 src/archives/
+rapport.csv
 
 # Dossier de sortie de compress-for-gphotos.py (copies compressées)
 output/
