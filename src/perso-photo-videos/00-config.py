@@ -115,6 +115,11 @@ UPLOAD_TPSLIMIT = 15        # plafond de requêtes/s vers l'API (rclone --tpslim
 #   au-delà de ~15-20, Google renvoie des 429 (rate limit) -> rclone back-off,
 #   souvent plus lent. La vraie limite est le quota Google Photos
 #   (~10 000 requêtes API/jour par projet OAuth) + le throttling serveur.
+UPLOAD_RETRIES = 1          # rclone --retries : nb de passes globales. 1 = échec
+#   RAPIDE quand le quota journalier Google (~10 000 req/jour) est atteint, au
+#   lieu de reboucler 3× pendant des heures pour rien. La reprise se fait au run
+#   suivant (rclone saute ce qui est déjà uploadé). Monter à 3 pour plus de
+#   résilience aux erreurs transitoires si le quota n'est pas un souci.
 UPLOAD_BATCH_MODE = "sync"  # rclone --gphotos-batch-mode : regroupe jusqu'à 50
 #   créations de médias par appel API au lieu d'un batchCreate (lent) par fichier
 #   -> upload bien plus rapide. "sync" (sûr, erreurs remontées par fichier),

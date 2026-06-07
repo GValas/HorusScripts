@@ -36,6 +36,7 @@ REMOTE="$(read_cfg UPLOAD_REMOTE)"
 TRANSFERS="$(read_cfg UPLOAD_TRANSFERS)"
 TPSLIMIT="$(read_cfg UPLOAD_TPSLIMIT)"
 BATCH_MODE="$(read_cfg UPLOAD_BATCH_MODE)"
+RETRIES="$(read_cfg UPLOAD_RETRIES)"
 RCLONE_DRY=""
 [ "$DRY_RUN" = "True" ] && RCLONE_DRY="--dry-run"
 
@@ -79,7 +80,7 @@ for d in "$SRC"/*/; do
   rclone copy "$d" "${REMOTE}:album/${album}" \
     $RCLONE_DRY --stats 30s --stats-one-line \
     --transfers "$TRANSFERS" --tpslimit "$TPSLIMIT" \
-    --gphotos-batch-mode "$BATCH_MODE" "$@"
+    --gphotos-batch-mode "$BATCH_MODE" --retries "$RETRIES" "$@"
   count=$((count + 1))
 done
 
