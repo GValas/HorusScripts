@@ -4,11 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
     image: horus-convert-h265
-    env_file: env/.env
-    environment:
-      # Surcharge le DRY_RUN d'env/.env par celui exporté par run-convert-h265.sh
-      # (le shell est prioritaire sur env/.env pour l'interpolation ${...}).
-      DRY_RUN: ${DRY_RUN:-false}
+    # Tous les réglages viennent de src/cine-videos/00-config.py (monté en LIVE
+    # ci-dessous), lu par les scripts via importlib — plus d'env_file ni de
+    # variables d'environnement. NAS_MOUNT (pour le volume ci-dessous) est
+    # exporté par run-cine-pipeline.sh, qui le lit dans 00-config.py.
     # Accès GPU NVIDIA pour NVENC (hevc_nvenc).
     # Nécessite nvidia-container-toolkit installé et configuré sur l'hôte.
     deploy:
@@ -22,8 +21,12 @@ services:
       # NAS en LECTURE-ÉCRITURE : le script supprime les originaux et écrit les
       # fichiers convertis. NE PAS mettre en lecture seule (:ro).
       - ${NAS_MOUNT}:${NAS_MOUNT}
+      # Scripts + 00-config.py montés en LIVE (comme le pipeline perso) : éditer
+      # la config prend effet sans rebuild.
+      - ./src/cine-videos:/work
+    working_dir: /work
     # On nettoie d'abord les noms (renommage), puis on convertit en HEVC.
-    # Les deux scripts partagent INPUT_FOLDERS / DRY_RUN (via env/.env).
+    # Les deux scripts partagent INPUT_FOLDERS / DRY_RUN (via 00-config.py).
     command: ["sh", "-c", "python3 01-clean-names.py && python3 02-convert-to-h265.py"]
     # Tâche ponctuelle, pas un service permanent
     restart: "no"

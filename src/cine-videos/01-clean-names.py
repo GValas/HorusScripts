@@ -6,33 +6,23 @@ import os
 import re
 import sys
 import logging
+import importlib.util
 from pathlib import Path
 
 ##################################################################
-
-# Mêmes variables d'environnement que 02-convert-to-h265.py (partagées via env/.env).
-# INPUT_FOLDERS : dossiers à parcourir, séparés par des virgules.
-ROOTS = [
-    p.strip()
-    for p in os.environ.get("INPUT_FOLDERS", "/mnt/horus/tvshows").split(",")
-    if p.strip()
-]
-# DRY_RUN : True = simulation sans renommage, False = renommage réel.
-# Défaut sûr (true) si non défini ; env/.env le force explicitement dans le container.
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in ("1", "true", "yes", "on")
-
+## Configuration : tout est dans 00-config.py (COMMUN + CLEAN_*)
 ##################################################################
 
+_spec = importlib.util.spec_from_file_location(
+    "pipeline_config", Path(__file__).with_name("00-config.py"))
+config = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(config)
 
-TECH_WORDS = set(
-    (
-        "1080p 2160p 4k 576p 720p aac ac3 bdrip bluray brrip "
-        "divx dts dvdrip fastsub french h264 x265 hdlight hdr hdtv hq "
-        "imax multi multitruefrench proper repack subfrench truefrench vff vostfr web "
-        "webdl webdl1080p webrip x264 x265 xvid "
-        "hevc h265 h.265 h.264 remux 10bit hc vf vo nf amzn yify "
-    ).split()
-)
+ROOTS = config.INPUT_FOLDERS          # dossiers parcourus récursivement
+DRY_RUN = config.DRY_RUN              # True = simulation, False = renommage réel
+TECH_WORDS = config.CLEAN_TECH_WORDS  # mots techniques retirés des noms
+
+##################################################################
 
 RE_EPISODE = re.compile(r"^(s\d{1,2}e\d{1,2}|\d{1,2}x\d{1,2}$)")
 

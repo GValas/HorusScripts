@@ -1,6 +1,6 @@
-import os
 import subprocess
 import json
+import importlib.util
 from datetime import datetime
 from pathlib import Path
 
@@ -29,21 +29,49 @@ def log(msg: str = "") -> None:
         print(f"{ts} | {line}")
 
 
-# ── Configuration (surchargeable par variables d'environnement en prod) ───────
-# INPUT_FOLDERS : liste séparée par des virgules
-#   ex: INPUT_FOLDERS="/mnt/horus/tvshows,/mnt/horus/movies,/mnt/horus/cartoons"
-INPUT_FOLDERS = [  # Root folders to scan recursively, one after another
-    p.strip()
-    for p in os.environ.get("INPUT_FOLDERS", "/mnt/horus/tvshows").split(",")
-    if p.strip()
-]
-CQ = int(os.environ.get("CQ", "26"))  # Quality (lower = better, 24–28 recommended)
-PRESET = os.environ.get("PRESET", "p4")  # p1 (fastest) → p7 (best quality)
-EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov"}
-SKIP_SUFFIX = "_x265"  # Files already converted (skips them)
-# DRY_RUN : True = simulate only, no conversion / no file written
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in ("1", "true", "yes", "on")
+# ── Configuration : tout est dans 00-config.py (COMMUN + CONVERT_*) ───────────
+_spec = importlib.util.spec_from_file_location(
+    "pipeline_config", Path(__file__).with_name("00-config.py"))
+config = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(config)
+
+INPUT_FOLDERS = config.INPUT_FOLDERS       # dossiers scannés récursivement
+CQ = config.CONVERT_CQ                      # qualité NVENC (+ bas = mieux)
+PRESET = config.CONVERT_PRESET             # préréglage NVENC (p1 → p7)
+EXTENSIONS = config.CONVERT_EXTENSIONS     # conteneurs vidéo scannés
+SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX   # fichiers déjà convertis (ignorés)
+DRY_RUN = config.DRY_RUN                    # True = simulation seule
+
+# Résolution max de sortie -> boîte (largeur, hauteur) à ne pas dépasser.
+# CONVERT_MAX_RESOLUTION (00-config.py) vaut une de ces clés, ou None (pas de
+# downscale). MAX_WIDTH/MAX_HEIGHT = None -> needs_downscale() renvoie toujours False.
+RESOLUTION_LIMITS = {
+    "480p": (854, 480),
+    "720p": (1280, 720),
+    "1080p": (1920, 1080),
+    "1440p": (2560, 1440),
+    "2160p": (3840, 2160),
+    "4k": (3840, 2160),
+}
+if config.CONVERT_MAX_RESOLUTION is None:
+    MAX_WIDTH = MAX_HEIGHT = None
+else:
+    _key = str(config.CONVERT_MAX_RESOLUTION).lower()
+    if _key not in RESOLUTION_LIMITS:
+        raise SystemExit(
+            f"CONVERT_MAX_RESOLUTION invalide : {config.CONVERT_MAX_RESOLUTION!r} "
+            f"(attendu : None ou {', '.join(RESOLUTION_LIMITS)})"
+        )
+    MAX_WIDTH, MAX_HEIGHT = RESOLUTION_LIMITS[_key]
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def needs_downscale(width, height) -> bool:
+    """True si la vidéo dépasse MAX_WIDTH/MAX_HEIGHT (donc à réduire)."""
+    return bool(
+        (MAX_WIDTH and width and width > MAX_WIDTH)
+        or (MAX_HEIGHT and height and height > MAX_HEIGHT)
+    )
 
 
 def get_video_info(filepath: Path) -> dict:
@@ -63,6 +91,8 @@ def get_video_info(filepath: Path) -> dict:
         streams = data.get("streams", [])
 
         codec = None
+        width = height = None
+        pix_fmt = color_trc = color_primaries = color_space = None
         audio_count = 0
         sub_codecs = []  # codec_name of each subtitle stream, in order
         all_streams = []  # {index, type, codec} for every stream, in order
@@ -72,7 +102,14 @@ def get_video_info(filepath: Path) -> dict:
             c = stream.get("codec_name", "").lower()
             all_streams.append({"index": stream.get("index"), "type": t, "codec": c})
             if t == "video" and codec is None:
+                # Main video stream: also grab geometry + HDR signalling.
                 codec = c
+                width = stream.get("width")
+                height = stream.get("height")
+                pix_fmt = stream.get("pix_fmt")
+                color_trc = stream.get("color_transfer")
+                color_primaries = stream.get("color_primaries")
+                color_space = stream.get("color_space")
             elif t == "audio":
                 audio_count += 1
             elif t == "subtitle":
@@ -80,6 +117,12 @@ def get_video_info(filepath: Path) -> dict:
 
         return {
             "codec": codec,
+            "width": width,
+            "height": height,
+            "pix_fmt": pix_fmt,
+            "color_trc": color_trc,
+            "color_primaries": color_primaries,
+            "color_space": color_space,
             "audio_tracks": audio_count,
             "subtitle_tracks": len(sub_codecs),
             "subtitle_codecs": sub_codecs,
@@ -90,6 +133,12 @@ def get_video_info(filepath: Path) -> dict:
         log(f"  [!] ffprobe error on {filepath.name}: {e}")
         return {
             "codec": None,
+            "width": None,
+            "height": None,
+            "pix_fmt": None,
+            "color_trc": None,
+            "color_primaries": None,
+            "color_space": None,
             "audio_tracks": 0,
             "subtitle_tracks": 0,
             "subtitle_codecs": [],
@@ -112,6 +161,19 @@ def convert_to_x265(input_path: Path) -> bool:
         f"{info['audio_tracks']} audio track(s) | "
         f"{info['subtitle_tracks']} subtitle track(s)"
     )
+
+    # Decide downscale + colour handling from the main video stream.
+    do_scale = needs_downscale(info["width"], info["height"])
+    is_hdr = (
+        info["color_trc"] in ("smpte2084", "arib-std-b67")
+        or info["color_primaries"] == "bt2020"
+    )
+    is_10bit = "10" in (info["pix_fmt"] or "")
+    if do_scale:
+        log(
+            f"  [↓] Downscale {info['width']}x{info['height']} → fit {MAX_WIDTH}x{MAX_HEIGHT}"
+            + (" (HDR 10-bit kept, Dolby Vision lost)" if is_hdr else "")
+        )
     log(f"  [→] Converting: {input_path.name}")
 
     if DRY_RUN:
@@ -150,11 +212,37 @@ def convert_to_x265(input_path: Path) -> bool:
         )
     expected_subs = kept_subs
 
+    # Downscale filter (aspect kept, never upscales) — only when oversized.
+    vf_args = []
+    if do_scale:
+        vf_args = [
+            "-vf",
+            f"scale={MAX_WIDTH}:{MAX_HEIGHT}"
+            ":force_original_aspect_ratio=decrease:force_divisible_by=2",
+        ]
+
+    # HDR / 10-bit: encode 10-bit (main10) and carry the bt2020/PQ signalling so
+    # the 1080p copy stays HDR. Dolby Vision dynamic metadata is not preserved.
+    depth_args = []
+    color_args = []
+    if is_hdr or is_10bit:
+        depth_args = ["-pix_fmt", "p010le", "-profile:v", "main10"]
+    if is_hdr:
+        color_args = [
+            "-color_primaries",
+            info["color_primaries"] or "bt2020",
+            "-color_trc",
+            info["color_trc"] or "smpte2084",
+            "-colorspace",
+            info["color_space"] or "bt2020nc",
+        ]
+
     cmd = [
         "ffmpeg",
         "-i",
         str(input_path),
         *map_args,
+        *vf_args,
         "-c:v",
         "hevc_nvenc",
         "-rc",
@@ -169,6 +257,8 @@ def convert_to_x265(input_path: Path) -> bool:
         PRESET,
         "-b:v",
         "0",
+        *depth_args,
+        *color_args,
         "-c:a",
         "copy",  # copy all audio tracks as-is
         *sub_args,  # per-stream: copy, or transcode WebVTT/mov_text to srt
@@ -260,12 +350,18 @@ def scan_and_convert(root: str) -> tuple[int, int]:
     for f in candidates:
         info = get_video_info(f)
         codec = info["codec"]
+        too_big = needs_downscale(info["width"], info["height"])
         if codec is None:
             log(f"  [?] Could not detect codec: {f.name}")
-        elif codec in ("hevc", "h265"):
+        elif codec in ("hevc", "h265") and not too_big:
             log(f"  [=] Already x265, skipping: {f.relative_to(root_path)}")
         else:
-            log(f"  [!] Not x265 ({codec}): {f.relative_to(root_path)}")
+            reason = (
+                f"downscale {info['width']}x{info['height']}"
+                if too_big
+                else f"not x265 ({codec})"
+            )
+            log(f"  [!] To convert ({reason}): {f.relative_to(root_path)}")
             to_convert.append(f)
 
     log(f"\n[*] {len(to_convert)} file(s) need conversion\n")

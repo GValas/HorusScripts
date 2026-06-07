@@ -29,13 +29,14 @@ Deux scripts enchaînés sur les mêmes dossiers (`INPUT_FOLDERS`) :
    NVIDIA), conserve toutes les pistes audio/sous-titres, puis **remplace
    l'original** après vérification du nombre de pistes.
 
-Réglages dans `env/.env` (`NAS_MOUNT`, `INPUT_FOLDERS`, `CQ`, `PRESET`, `DRY_RUN`),
-partagés par les deux scripts. Lancement :
+Réglages centralisés dans [`src/cine-videos/00-config.py`](src/cine-videos/00-config.py)
+(`NAS_MOUNT`, `INPUT_FOLDERS`, `DRY_RUN`, `CLEAN_*`, `CONVERT_*`), partagés par
+les deux scripts — même principe que le pipeline perso, plus d'`env/.env`. Lancement :
 
 ```bash
-./run-cine-pipeline.sh --DRY_RUN=true   # simulation (recommandé d'abord)
-./run-cine-pipeline.sh                  # réel
-# Tout argument supplémentaire est transmis à `docker compose up`.
+./run-cine-pipeline.sh        # demande confirmation si DRY_RUN=False
+./run-cine-pipeline.sh -y     # sans confirmation
+# Tout autre argument est transmis à `docker compose up` (ex: -d).
 ```
 
 ---
@@ -159,22 +160,25 @@ relancer Ubuntu.
 
 ## Configuration
 
-### Ciné — `env/.env`
+### Ciné — `src/cine-videos/00-config.py`
 
-```bash
-cp env/.env.example env/.env   # gitignored ; éditer ensuite
-```
+Tous les réglages sont des variables Python dans ce fichier (pas d'env), chargé
+par les deux scripts via `importlib` — même principe que le pipeline perso.
 
 | Variable | Défaut | Description |
 |---|---|---|
 | `NAS_MOUNT` | `/mnt/wsl/horus` | Point de montage NAS (monté tel quel dans le conteneur) |
-| `INPUT_FOLDERS` | `…/tvshows,…/movies,…/cartoons` | Dossiers à scanner, séparés par des virgules (doivent être **sous** `NAS_MOUNT`) |
-| `CQ` | `26` | Qualité NVENC (plus bas = meilleur, 24–28 conseillé) |
-| `PRESET` | `p4` | Préréglage NVENC, `p1` (rapide) → `p7` (qualité) |
-| `DRY_RUN` | `false` | `true` = simulation, aucun fichier renommé/écrit/supprimé |
+| `INPUT_FOLDERS` | `…/tvshows`, `…/movies`, `…/cartoons` | Dossiers à scanner (doivent être **sous** `NAS_MOUNT`) |
+| `DRY_RUN` | `False` | `True` = simulation, aucun fichier renommé/écrit/supprimé |
+| `CONVERT_CQ` | `26` | Qualité NVENC (plus bas = meilleur, 24–28 conseillé) |
+| `CONVERT_PRESET` | `p4` | Préréglage NVENC, `p1` (rapide) → `p7` (qualité) |
+| `CONVERT_EXTENSIONS` | `.mkv .mp4 .avi .m4v .mov` | Conteneurs vidéo scannés |
+| `CONVERT_SKIP_SUFFIX` | `_x265` | Suffixe des fichiers déjà convertis (ignorés) |
+| `CONVERT_MAX_RESOLUTION` | `None` | Résolution max de sortie (`"720p"`, `"1080p"`, `"1440p"`, `"2160p"`/`"4k"`). Les fichiers plus grands sont downscalés (HDR 10-bit préservé, Dolby Vision perdu). `None` = pas de downscale |
+| `CLEAN_TECH_WORDS` | (liste) | Mots techniques retirés des noms par 01 |
 
-`NAS_MOUNT` est aussi consommé par `docker compose` pour le mapping de volume,
-d'où l'option `--env-file env/.env` (cf. le lanceur).
+`NAS_MOUNT` est aussi consommé par `docker compose` pour le mapping de volume :
+le lanceur le lit dans `00-config.py` et l'exporte avant `docker compose up`.
 
 ### Perso — `src/perso-photo-videos/00-config.py`
 
@@ -216,6 +220,7 @@ HorusScripts/
 ├── run-perso-pipeline.sh          # Lanceur perso (orchestre 01→04 en docker run)
 ├── src/
 │   ├── cine-videos/
+│   │   ├── 00-config.py            # Réglages centralisés des 2 scripts
 │   │   ├── 01-clean-names.py       # Renommage (avant conversion)
 │   │   └── 02-convert-to-h265.py   # Ré-encodage NVENC HEVC
 │   ├── perso-photo-videos/
@@ -226,7 +231,6 @@ HorusScripts/
 │   │   └── 04-upload-to-gphotos.sh # Upload rclone → Google Photos
 │   └── archives/                   # Scratch gitignoré (ancien uploader, audits, CSV)
 ├── env/
-│   ├── .env / .env.example         # Config ciné (.env gitignored)
 │   └── rclone.conf / .example      # Auth Google Photos (rclone.conf gitignored)
 ├── .devcontainer/                  # Dev container VS Code
 ├── Dockerfile                      # Image unique horus-convert-h265 (CUDA + ffmpeg + Pillow/piexif/rclone)

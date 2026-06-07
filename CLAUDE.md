@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A personal toolkit for managing a home NAS named **horus** (SMB/CIFS share holding media: `movies`, `tvshows`, `cartoons`, `photos`, `perso`). Python 3.12. The repo is organized as **two independent pipelines** under `src/`, plus a scratch/archive folder:
 
-- **`src/cine-videos/`** — clean movie/TV filenames and re-encode to HEVC. Env-driven, run via **docker-compose**.
+- **`src/cine-videos/`** — clean movie/TV filenames and re-encode to HEVC. Config-file-driven (`00-config.py`), run via **docker-compose**.
 - **`src/perso-photo-videos/`** — a 4-step personal photo/video pipeline (normalize → date → compress → upload to Google Photos). Config-file-driven, run via the **`run-perso-pipeline.sh`** orchestrator.
 - **`src/archives/`** — gitignored scratch: the old Python uploader (`04-…py.bak`), one-off audit scripts, and generated CSV reports. Not part of any pipeline; nothing imports it.
 
@@ -31,24 +31,24 @@ To run a script outside Docker you'd have to install these yourself, but the int
 
 ## Path convention — `/mnt/wsl/horus`, never `/mnt/horus`
 
-Everything runs in Linux/containers and targets the NAS at **`/mnt/wsl/horus`**. The ciné pipeline reads the mount from the `NAS_MOUNT` env var (`env/.env`); the perso pipeline hardcodes `NAS_PHOTOS = "/mnt/wsl/horus/photos"` in [src/perso-photo-videos/00-config.py](src/perso-photo-videos/00-config.py).
+Everything runs in Linux/containers and targets the NAS at **`/mnt/wsl/horus`**. Both pipelines hardcode the mount in their `00-config.py`: `NAS_MOUNT = "/mnt/wsl/horus"` for ciné ([src/cine-videos/00-config.py](src/cine-videos/00-config.py)), `NAS_PHOTOS = "/mnt/wsl/horus/photos"` for perso ([src/perso-photo-videos/00-config.py](src/perso-photo-videos/00-config.py)).
 
 **Use `/mnt/wsl/horus`, not `/mnt/horus`.** A bind on `/mnt/horus` makes the container see empty folders — see the NAS-mounting section below for why. This applies everywhere (containers and local runs).
 
 ## The ciné pipeline (`src/cine-videos/`)
 
-Two stdlib-only scripts (ffmpeg/ffprobe binaries aside), driven by **environment variables** (set in `env/.env`, overridable per-run):
+Two stdlib-only scripts (ffmpeg/ffprobe binaries aside), **all configured from one file**, [00-config.py](src/cine-videos/00-config.py) — same principle as the perso pipeline, no env vars. It holds a COMMON section (`NAS_MOUNT`, `INPUT_FOLDERS`, single `DRY_RUN`) plus a per-script section (`CLEAN_*` for 01, `CONVERT_*` for 02). Both scripts load it via `importlib` (the `00-config.py` filename has digits/`-`, so it isn't importable directly).
 
 - [01-clean-names.py](src/cine-videos/01-clean-names.py) — rename movies/shows: strip technical tokens (codecs, resolutions, release groups) and apply naming conventions. Detects **collisions** (two names mapping to the same target) before applying.
 - [02-convert-to-h265.py](src/cine-videos/02-convert-to-h265.py) — re-encode to HEVC via NVENC, with colorized timestamped logging and stream-count verification.
 
-Both read `INPUT_FOLDERS` (comma-separated NAS dirs) and `DRY_RUN` from the environment. The compose service `convert-h265` runs them in sequence: `python3 01-clean-names.py && python3 02-convert-to-h265.py`.
+The compose service `convert-h265` mounts `src/cine-videos` live at `/work` and runs them in sequence: `python3 01-clean-names.py && python3 02-convert-to-h265.py`. The launcher reads `NAS_MOUNT`/`DRY_RUN` from `00-config.py` (small inline `python3` call), exports `NAS_MOUNT` so compose can interpolate the volume bind, and prompts to confirm if `DRY_RUN=False` (02 deletes originals).
 
 Run it:
 
 ```bash
-./run-cine-pipeline.sh --DRY_RUN=true        # simulate (recommended first)
-./run-cine-pipeline.sh                        # real (default DRY_RUN=false here)
+./run-cine-pipeline.sh        # prompts to confirm if DRY_RUN=False
+./run-cine-pipeline.sh -y     # skip the confirmation
 ```
 
 ## The perso pipeline (`src/perso-photo-videos/`)
@@ -81,7 +81,7 @@ The orchestrator mounts the perso scripts live (`-v src/perso-photo-videos:/work
 
 ## Configuration
 
-- **Ciné:** copy `env/.env.example` → `env/.env` (gitignored). Set `NAS_MOUNT` (= `/mnt/wsl/horus`), `INPUT_FOLDERS`, `DRY_RUN`, and NVENC `CQ`/`PRESET`. Consumed by `docker compose` (volume interpolation + container env).
+- **Ciné:** edit [src/cine-videos/00-config.py](src/cine-videos/00-config.py) directly — no env vars. Set `NAS_MOUNT` (= `/mnt/wsl/horus`), `INPUT_FOLDERS`, `DRY_RUN`, and NVENC `CONVERT_CQ`/`CONVERT_PRESET`. The launcher exports `NAS_MOUNT` (read from this file) so `docker compose` can interpolate the volume bind.
 - **Perso:** edit [src/perso-photo-videos/00-config.py](src/perso-photo-videos/00-config.py) directly — no env vars.
 - **Upload auth:** copy `env/rclone.conf.example` → `env/rclone.conf` (gitignored) and fill `client_id` / `client_secret` / `token`. Get the token with `rclone authorize "google photos"` on a machine with a browser + rclone (no rclone needed on this host). The launcher bind-mounts this file into the container at runtime — **secrets are never baked into the image and must never be committed** (only the `.example` placeholder is tracked).
 
@@ -90,9 +90,9 @@ The orchestrator mounts the perso scripts live (`-v src/perso-photo-videos:/work
 Both pipelines build the same image, `horus-convert-h265`:
 
 ```bash
-# Ciné — compose (env/.env required so ${NAS_MOUNT} interpolates):
-docker compose --env-file env/.env up convert-h265
-# …or just: ./run-cine-pipeline.sh
+# Ciné — compose (NAS_MOUNT must be exported so ${NAS_MOUNT} interpolates):
+export NAS_MOUNT=/mnt/wsl/horus && docker compose up convert-h265
+# …or just: ./run-cine-pipeline.sh   (reads NAS_MOUNT from 00-config.py)
 
 # Perso — orchestrator (docker run under the hood):
 ./run-perso-pipeline.sh
@@ -104,7 +104,7 @@ docker compose --env-file env/.env up convert-h265
 
 ## NAS mounting (WSL host — `/etc/`)
 
-The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from `/etc/wsl.conf` (`[boot] command = /etc/mount-nas-horus.sh`). Both files live in `/etc/`, **not in this repo** (host/machine config, require `sudo` to edit). The script mounts the CIFS shares (`photos movies tvshows cartoons`) from `//192.168.1.182` using `~/.nas-credentials` (hardcoded — it does **not** read `env/.env`).
+The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from `/etc/wsl.conf` (`[boot] command = /etc/mount-nas-horus.sh`). Both files live in `/etc/`, **not in this repo** (host/machine config, require `sudo` to edit). The script mounts the CIFS shares (`photos movies tvshows cartoons`) from `//192.168.1.182` using `~/.nas-credentials` (hardcoded — it does **not** read any pipeline config).
 
 Key trick: Docker Desktop runs in a separate WSL distro that only sees Ubuntu's FS via `/mnt/wsl` (propagation `shared`). A CIFS mount under `/mnt/horus` is invisible in containers, so the script mounts the real CIFS under `/mnt/wsl/horus/*` (Docker-visible, `--make-shared`) and bind-mirrors it to `/mnt/horus/*` for convenience. It is idempotent (guards each mount with `mountpoint -q`) and can be re-run by hand.
 

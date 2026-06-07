@@ -38,8 +38,10 @@ RUN pip install --no-cache-dir --break-system-packages Pillow piexif
 ENV TZ=Europe/Paris
 
 WORKDIR /app
-COPY src/cine-videos/01-clean-names.py ./01-clean-names.py
-COPY src/cine-videos/02-convert-to-h265.py ./02-convert-to-h265.py
+# Les scripts ciné (01/02 + 00-config.py) ne sont PAS copiés ici : le lanceur
+# run-cine-pipeline.sh les monte en LIVE dans /work via docker-compose (comme le
+# pipeline perso). Les y baker collisionnerait d'ailleurs avec le 00-config.py
+# perso ci-dessous (même cible /app/00-config.py) et chargerait la mauvaise config.
 # 00-config.py doit être à côté des scripts perso (chargé via Path(__file__)).
 COPY src/perso-photo-videos/00-config.py ./00-config.py
 COPY src/perso-photo-videos/03-compress-for-gphotos.py ./03-compress-for-gphotos.py
