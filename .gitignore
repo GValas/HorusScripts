@@ -12,5 +12,9 @@ env/rclone.conf
 src/archives/
 rapport.csv
 
+# Cache de scan ffprobe (codec/dimensions par fichier) — généré, non versionné
+.scan-cache.json
+**/.scan-cache.json
+
 # Dossier de sortie de compress-for-gphotos.py (copies compressées)
 output/

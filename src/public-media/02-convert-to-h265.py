@@ -42,6 +42,12 @@ PRESET = config.CONVERT_PRESET  # préréglage NVENC (p1 → p7)
 EXTENSIONS = config.CONVERT_EXTENSIONS  # conteneurs vidéo scannés
 SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX  # fichiers déjà convertis (ignorés)
 DRY_RUN = config.DRY_RUN  # True = simulation seule
+# Cache de scan (codec/dimensions par fichier) ; None = désactivé.
+SCAN_CACHE_PATH = (
+    Path(__file__).with_name(config.CONVERT_SCAN_CACHE)
+    if getattr(config, "CONVERT_SCAN_CACHE", None)
+    else None
+)
 
 # Résolution max de sortie -> boîte (largeur, hauteur) à ne pas dépasser.
 # CONVERT_MAX_RESOLUTION (00-config.py) vaut une de ces clés, ou None (pas de
@@ -166,6 +172,56 @@ def get_duration(filepath: Path) -> float | None:
         return float(dur) if dur is not None else None
     except Exception:
         return None
+
+
+def load_scan_cache(path: Path | None) -> dict:
+    """Charge le cache de scan JSON (clé = chemin) ; {} si absent/désactivé."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_scan_cache(path: Path | None, cache: dict) -> None:
+    """Écrit le cache de scan (best-effort : une erreur d'écriture est ignorée)."""
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def probe_for_scan(f: Path, cache: dict) -> tuple:
+    """(codec, width, height) pour la décision de scan, avec cache (mtime+size).
+
+    Sur hit de cache valide, on évite l'appel ffprobe ; sinon on sonde et on
+    mémorise. La conversion elle-même re-sonde toujours le fichier en entier.
+    """
+    try:
+        st = f.stat()
+    except OSError:
+        info = get_video_info(f)
+        return info["codec"], info["width"], info["height"]
+
+    key = str(f)
+    ent = cache.get(key)
+    if ent and ent.get("mtime") == int(st.st_mtime) and ent.get("size") == st.st_size:
+        return ent.get("codec"), ent.get("width"), ent.get("height")
+
+    info = get_video_info(f)
+    cache[key] = {
+        "mtime": int(st.st_mtime),
+        "size": st.st_size,
+        "codec": info["codec"],
+        "width": info["width"],
+        "height": info["height"],
+    }
+    return info["codec"], info["width"], info["height"]
 
 
 def enough_space(target_dir: Path, needed: int) -> bool:
@@ -381,7 +437,7 @@ def convert_to_x265(input_path: Path) -> bool:
         return False
 
 
-def scan_and_convert(root: str) -> tuple[int, int]:
+def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
     root_path = Path(root)
 
     if not root_path.exists():
@@ -399,19 +455,14 @@ def scan_and_convert(root: str) -> tuple[int, int]:
 
     to_convert = []
     for f in candidates:
-        info = get_video_info(f)
-        codec = info["codec"]
-        too_big = needs_downscale(info["width"], info["height"])
+        codec, width, height = probe_for_scan(f, cache)
+        too_big = needs_downscale(width, height)
         if codec is None:
             log(f"  [?] Could not detect codec: {f.name}")
         elif codec in ("hevc", "h265") and not too_big:
             log(f"  [=] Already x265, skipping: {f.relative_to(root_path)}")
         else:
-            reason = (
-                f"downscale {info['width']}x{info['height']}"
-                if too_big
-                else f"not x265 ({codec})"
-            )
+            reason = f"downscale {width}x{height}" if too_big else f"not x265 ({codec})"
             log(f"  [!] To convert ({reason}): {f.relative_to(root_path)}")
             to_convert.append(f)
 
@@ -443,14 +494,18 @@ if __name__ == "__main__":
     if DRY_RUN:
         log("[*] DRY-RUN mode: simulation only, no file will be converted\n")
 
+    scan_cache = load_scan_cache(SCAN_CACHE_PATH)
+
     total_success, total_failed = 0, 0
     for folder in INPUT_FOLDERS:
         log("\n" + "═" * 60)
         log(f"[*] Folder: {folder}")
         log("═" * 60 + "\n")
-        s, f = scan_and_convert(folder)
+        s, f = scan_and_convert(folder, scan_cache)
         total_success += s
         total_failed += f
+
+    save_scan_cache(SCAN_CACHE_PATH, scan_cache)
 
     if len(INPUT_FOLDERS) > 1:
         log("\n" + "═" * 60)

@@ -92,6 +92,12 @@ CONVERT_OUTPUT_SUFFIX = VIDEO_EXT  # conteneur de sortie (= .mkv commun)
 CONVERT_AUDIO_CODEC = "aac"  # ré-encodage audio (archivage)
 CONVERT_AUDIO_BITRATE = "192k"
 
+# Cache de scan : mémorise le codec par fichier, validé par (mtime, taille), pour
+# éviter de re-sonder via ffprobe TOUTE la bibliothèque à chaque run (gain majeur
+# sur les runs répétés). Fichier JSON à côté des scripts (gitignoré) ; None pour
+# désactiver.
+CONVERT_SCAN_CACHE = ".scan-cache.json"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 02 — enrich-movies-photos-with-date
 #   Complète les dates de prise de vue manquantes (EXIF photos, creation_time

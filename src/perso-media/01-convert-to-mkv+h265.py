@@ -23,6 +23,7 @@ Prérequis : ffmpeg + ffprobe installés et accessibles dans le PATH
 """
 
 import os
+import json
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,12 @@ CQ = config.VIDEO_CQ
 NVENC_PRESET = config.VIDEO_PRESET
 AUDIO_CODEC = config.CONVERT_AUDIO_CODEC
 AUDIO_BITRATE = config.CONVERT_AUDIO_BITRATE
+# Cache de scan (codec par fichier) ; None = désactivé.
+SCAN_CACHE_PATH = (
+    Path(__file__).with_name(config.CONVERT_SCAN_CACHE)
+    if getattr(config, "CONVERT_SCAN_CACHE", None)
+    else None
+)
 # ───────────────────────────────────────────────────────────
 
 
@@ -126,6 +133,44 @@ def get_video_codec(path: Path) -> str | None:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout.strip() or None
+
+
+def load_scan_cache(path: Path | None) -> dict:
+    """Charge le cache de scan JSON (clé = chemin) ; {} si absent/désactivé."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_scan_cache(path: Path | None, cache: dict) -> None:
+    """Écrit le cache de scan (best-effort : une erreur d'écriture est ignorée)."""
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def get_video_codec_cached(path: Path, cache: dict) -> str | None:
+    """Codec vidéo avec cache validé par (mtime, taille) : évite un ffprobe par
+    fichier déjà connu et inchangé. Sur miss/changement, sonde et mémorise."""
+    try:
+        st = path.stat()
+    except OSError:
+        return get_video_codec(path)
+    key = str(path)
+    ent = cache.get(key)
+    if ent and ent.get("mtime") == int(st.st_mtime) and ent.get("size") == st.st_size:
+        return ent.get("codec")
+    codec = get_video_codec(path)
+    cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "codec": codec}
+    return codec
 
 
 def enough_space(target_dir: Path, needed: int) -> bool:
@@ -506,6 +551,7 @@ def main():
     total_size = 0
     skipped = encoded = remuxed = errors = already_h265 = 0
     start_total = datetime.now()
+    scan_cache = load_scan_cache(SCAN_CACHE_PATH)
 
     for i, input_file in enumerate(candidates, 1):
         relative = input_file.relative_to(SOURCE_DIR)
@@ -513,7 +559,7 @@ def main():
         src_stat = input_file.stat()
         size = src_stat.st_size
 
-        codec = get_video_codec(input_file)
+        codec = get_video_codec_cached(input_file, scan_cache)
         codec_label = codec or "inconnu"
 
         logger.info(
@@ -694,6 +740,7 @@ def main():
             errors += 1
 
     elapsed_total = (datetime.now() - start_total).seconds
+    save_scan_cache(SCAN_CACHE_PATH, scan_cache)
 
     # ── Bilan final ─────────────────────────────────────────
     logger.info("")
