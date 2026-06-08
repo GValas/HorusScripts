@@ -56,6 +56,12 @@ VIDEO_PRESET = "p4"  # préréglage NVENC : p1 (rapide) → p7 (qualité)
 MIN_PLAUSIBLE_YEAR = 1990
 MAX_PLAUSIBLE_YEAR = 2100
 
+# Notification de fin de pipeline (les runs durent souvent des heures). URL d'un
+# webhook recevant le message de bilan en POST (texte brut) — ex. ntfy.sh :
+# "https://ntfy.sh/mon-canal-prive". None = aucune notification (défaut).
+# Le lanceur appelle src/perso-media/notify.py en fin de run (succès ET échec).
+NOTIFY_WEBHOOK = None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 01 — convert-to-mkv+h265
 #   Met TOUTE vidéo en H.265 + MKV (NVENC obligatoire) et normalise les photos

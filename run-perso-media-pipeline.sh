@@ -94,6 +94,12 @@ run_step() {  # $1 = libellé
   echo; echo "──────── $1 ────────"
 }
 
+# Notification de fin (no-op si NOTIFY_WEBHOOK=None). Sur erreur (set -e), le
+# trap envoie l'échec avec l'étape fautive avant de quitter.
+notify() { python3 "$SCRIPTS_DIR/notify.py" "$1" >/dev/null 2>&1 || true; }
+MODE_LABEL="$([ "$DRY_RUN" = "True" ] && echo DRY-RUN || echo RÉEL)"
+trap 'notify "❌ Pipeline perso-media ÉCHEC (étape ${step:-?}, mode ${MODE_LABEL})"' ERR
+
 for step in "${STEPS[@]}"; do
   case "$step" in
     01) run_step "01 convert-to-mkv+h265"
@@ -114,3 +120,6 @@ done
 echo; echo "════════════════════════════════════════════════════════════"
 echo " Pipeline terminé (${STEPS[*]})."
 echo "════════════════════════════════════════════════════════════"
+
+trap - ERR  # succès : on désarme le trap d'échec avant la notification finale
+notify "✅ Pipeline perso-media terminé (étapes ${STEPS[*]}, mode ${MODE_LABEL})"

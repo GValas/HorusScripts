@@ -64,5 +64,14 @@ if [ "$DRY_RUN" != "True" ] && [ "$ASSUME_YES" -ne 1 ]; then
   case "$ans" in y|Y|o|O) ;; *) echo "Annulé."; exit 0;; esac
 fi
 
+# Notification de fin (no-op si NOTIFY_WEBHOOK=None). Sur erreur, le trap envoie
+# l'échec avant de quitter (set -e).
+notify() { python3 "src/public-media/notify.py" "$1" >/dev/null 2>&1 || true; }
+MODE_LABEL="$([ "$DRY_RUN" = "True" ] && echo DRY-RUN || echo RÉEL)"
+trap 'notify "❌ Pipeline public-media ÉCHEC (mode ${MODE_LABEL})"' ERR
+
 docker compose up --build --no-log-prefix \
   "${PASS_ARGS[@]+"${PASS_ARGS[@]}"}" convert-h265
+
+trap - ERR  # succès : on désarme le trap d'échec avant la notification finale
+notify "✅ Pipeline public-media terminé (mode ${MODE_LABEL})"

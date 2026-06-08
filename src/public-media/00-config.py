@@ -40,6 +40,12 @@ INPUT_FOLDERS = [
 #           conversion réussie.
 DRY_RUN = False
 
+# Notification de fin de pipeline (les runs durent souvent des heures). URL d'un
+# webhook recevant le message de bilan en POST (texte brut) — ex. ntfy.sh :
+# "https://ntfy.sh/mon-canal-prive". None = aucune notification (défaut).
+# Le lanceur appelle src/public-media/notify.py en fin de run (succès ET échec).
+NOTIFY_WEBHOOK = None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 01 — clean-names
 #   Renomme dossiers/fichiers : retire les jetons techniques (codecs, résolutions,
