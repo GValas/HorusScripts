@@ -6,8 +6,10 @@ FROM python:3.12-slim
 #   (NB : 02-convert-to-h265.py encode en hevc_nvenc / NVENC et nécessite donc en plus
 #    un GPU NVIDIA + drivers exposés au conteneur pour fonctionner à l'exécution).
 # tzdata : aligne les timestamps des logs sur l'heure de Paris (sinon UTC, -2h).
+# git    : contrôle de version dans le conteneur de dev.
+# curl   : requis par l'installeur natif de Claude Code (ci-dessous).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tzdata \
+    && apt-get install -y --no-install-recommends ffmpeg tzdata git curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Fuseau horaire : timestamps des logs à l'heure de Paris.
@@ -25,3 +27,8 @@ RUN pip install --no-cache-dir piexif hachoir Pillow pillow-heif \
 
 RUN useradd -m -s /bin/bash devuser
 USER devuser
+
+# Claude Code CLI (commande « claude ») via l'installeur natif Anthropic.
+# Installé pour devuser dans ~/.local/bin (pas besoin de Node.js).
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/home/devuser/.local/bin:${PATH}"

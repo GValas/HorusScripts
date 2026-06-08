@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('src/cine-videos/convert-h265.py', doraise=True\\)\")",
+      "Bash(docker compose *)",
+      "Bash(command -v docker)",
+      "Bash(docker --version)",
+      "Bash(python3 -c \"import PIL; print\\('Pillow', PIL.__version__\\)\")"
+    ]
+  }
+}
