@@ -588,6 +588,7 @@ def main():
 
     total_size = 0
     skipped = encoded = remuxed = errors = already_h265 = 0
+    saved_old = saved_new = 0  # cumul tailles avant/après (bilan « espace »)
     start_total = datetime.now()
     scan_cache = load_scan_cache(SCAN_CACHE_PATH)
     prewarm_codecs(candidates, scan_cache)  # pré-sonde // les codecs (cache-miss)
@@ -765,6 +766,13 @@ def main():
                         input_file.name,
                         e,
                     )
+            # Cumul pour le bilan « espace » (conversion menée à terme).
+            try:
+                saved_old += size
+                saved_new += final_file.stat().st_size
+            except OSError:
+                pass
+
             ext_stats[ext]["converted"] += 1
             codec_stats[codec_label]["converted"] += 1
             if action == "encode":
@@ -791,6 +799,16 @@ def main():
     logger.info("  Déjà H.265 (ignorés)  : %d", already_h265)
     logger.info("  Ignorés (cible exist.): %d", skipped)
     logger.info("  Taille à convertir    : %s", human_size_bytes(total_size))
+    if saved_old > 0:
+        saved = saved_old - saved_new
+        pct = 100 * saved / saved_old
+        logger.info(
+            "  Espace économisé      : %s → %s  (gain %s, %.1f%%)",
+            human_size_bytes(saved_old),
+            human_size_bytes(saved_new),
+            human_size_bytes(saved),
+            pct,
+        )
     logger.info("")
 
     print_bilan(logger, "Par extension", ext_stats, label_width=8)

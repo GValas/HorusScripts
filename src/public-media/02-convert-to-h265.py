@@ -14,21 +14,36 @@ YELLOW = "\033[93m"
 RESET = "\033[0m"
 
 
+# Fichier log (ouvert dans main) : trace persistante du run, en plus de stdout.
+LOG_FILE_HANDLE = None
+
+# Cumul des tailles avant/après pour le bilan « espace économisé » du run.
+STATS = {"old_bytes": 0, "new_bytes": 0}
+
+
 def log(msg: str = "") -> None:
     """Affiche un message en préfixant chaque ligne d'un timestamp.
 
-    Colore automatiquement chaque ligne : vert pour les succès ([✓]),
-    rouge pour les erreurs ([✗]), jaune pour les avertissements ([!]).
+    Colore automatiquement chaque ligne sur stdout : vert pour les succès ([✓]),
+    rouge pour les erreurs ([✗]), jaune pour les avertissements ([!]). Écrit
+    aussi la ligne brute (sans codes couleur) dans le fichier log si ouvert.
     """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for line in str(msg).split("\n"):
+        colored = line
         if "[✗]" in line:
-            line = f"{RED}{line}{RESET}"
+            colored = f"{RED}{line}{RESET}"
         elif "[✓]" in line:
-            line = f"{GREEN}{line}{RESET}"
+            colored = f"{GREEN}{line}{RESET}"
         elif "[!]" in line:
-            line = f"{YELLOW}{line}{RESET}"
-        print(f"{ts} | {line}")
+            colored = f"{YELLOW}{line}{RESET}"
+        print(f"{ts} | {colored}")
+        if LOG_FILE_HANDLE is not None:
+            try:
+                LOG_FILE_HANDLE.write(f"{ts} | {line}\n")
+                LOG_FILE_HANDLE.flush()
+            except OSError:
+                pass
 
 
 # ── Configuration : tout est dans 00-config.py (COMMUN + CONVERT_*) ───────────
@@ -424,8 +439,10 @@ def convert_to_x265(input_path: Path) -> bool:
         audio_ok = out_info["audio_tracks"] == info["audio_tracks"]
         sub_ok = out_info["subtitle_tracks"] == expected_subs
 
-        old_mb = input_path.stat().st_size / 1024 / 1024
-        new_mb = output_path.stat().st_size / 1024 / 1024
+        old_bytes = input_path.stat().st_size
+        new_bytes = output_path.stat().st_size
+        old_mb = old_bytes / 1024 / 1024
+        new_mb = new_bytes / 1024 / 1024
         saving = 100 - (new_mb / old_mb * 100)
 
         log(f"  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB " f"(saved {saving:.1f}%)")
@@ -471,6 +488,11 @@ def convert_to_x265(input_path: Path) -> bool:
         input_path.unlink()
         output_path.rename(final_path)
         log(f"  [✓] Replaced original → {final_path.name}")
+
+        # Cumul pour le bilan « espace économisé » (uniquement les conversions
+        # menées à terme et validées).
+        STATS["old_bytes"] += old_bytes
+        STATS["new_bytes"] += new_bytes
 
         return True
 
@@ -542,7 +564,24 @@ def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
     return success, failed
 
 
+def _human_bytes(size: float) -> str:
+    for unit in ("o", "Ko", "Mo", "Go"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} To"
+
+
 if __name__ == "__main__":
+    # Fichier log persistant (à côté des scripts, gitignoré), en plus de stdout.
+    log_name = "dry_run.log" if DRY_RUN else "conversion.log"
+    try:
+        LOG_FILE_HANDLE = open(
+            Path(__file__).with_name(log_name), "a", encoding="utf-8"
+        )
+    except OSError:
+        LOG_FILE_HANDLE = None
+
     if DRY_RUN:
         log("[*] DRY-RUN mode: simulation only, no file will be converted\n")
 
@@ -565,3 +604,15 @@ if __name__ == "__main__":
         log(f"[✓] Converted successfully : {total_success}")
         log(f"[✗] Failed                 : {total_failed}")
         log("═" * 60)
+
+    # Bilan « espace économisé » sur les conversions menées à terme.
+    if STATS["old_bytes"] > 0:
+        saved = STATS["old_bytes"] - STATS["new_bytes"]
+        pct = 100 * saved / STATS["old_bytes"]
+        log(
+            f"[*] Space: {_human_bytes(STATS['old_bytes'])} → "
+            f"{_human_bytes(STATS['new_bytes'])}  (saved {_human_bytes(saved)}, {pct:.1f}%)"
+        )
+
+    if LOG_FILE_HANDLE is not None:
+        LOG_FILE_HANDLE.close()
