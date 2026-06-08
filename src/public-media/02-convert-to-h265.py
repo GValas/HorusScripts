@@ -4,7 +4,6 @@ import importlib.util
 from datetime import datetime
 from pathlib import Path
 
-
 # Codes couleur ANSI : succès en vert, erreurs en rouge, avertissements en jaune.
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -31,16 +30,17 @@ def log(msg: str = "") -> None:
 
 # ── Configuration : tout est dans 00-config.py (COMMUN + CONVERT_*) ───────────
 _spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py"))
+    "pipeline_config", Path(__file__).with_name("00-config.py")
+)
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-INPUT_FOLDERS = config.INPUT_FOLDERS       # dossiers scannés récursivement
-CQ = config.CONVERT_CQ                      # qualité NVENC (+ bas = mieux)
-PRESET = config.CONVERT_PRESET             # préréglage NVENC (p1 → p7)
-EXTENSIONS = config.CONVERT_EXTENSIONS     # conteneurs vidéo scannés
-SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX   # fichiers déjà convertis (ignorés)
-DRY_RUN = config.DRY_RUN                    # True = simulation seule
+INPUT_FOLDERS = config.INPUT_FOLDERS  # dossiers scannés récursivement
+CQ = config.CONVERT_CQ  # qualité NVENC (+ bas = mieux)
+PRESET = config.CONVERT_PRESET  # préréglage NVENC (p1 → p7)
+EXTENSIONS = config.CONVERT_EXTENSIONS  # conteneurs vidéo scannés
+SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX  # fichiers déjà convertis (ignorés)
+DRY_RUN = config.DRY_RUN  # True = simulation seule
 
 # Résolution max de sortie -> boîte (largeur, hauteur) à ne pas dépasser.
 # CONVERT_MAX_RESOLUTION (00-config.py) vaut une de ces clés, ou None (pas de
@@ -144,6 +144,27 @@ def get_video_info(filepath: Path) -> dict:
             "subtitle_codecs": [],
             "streams": [],
         }
+
+
+def get_duration(filepath: Path) -> float | None:
+    """Durée du fichier en secondes (ffprobe format.duration) ; None si indéterminée."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_entries",
+        "format=duration",
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        data = json.loads(result.stdout)
+        dur = (data.get("format") or {}).get("duration")
+        return float(dur) if dur is not None else None
+    except Exception:
+        return None
 
 
 def convert_to_x265(input_path: Path) -> bool:
@@ -281,10 +302,7 @@ def convert_to_x265(input_path: Path) -> bool:
         new_mb = output_path.stat().st_size / 1024 / 1024
         saving = 100 - (new_mb / old_mb * 100)
 
-        log(
-            f"  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB "
-            f"(saved {saving:.1f}%)"
-        )
+        log(f"  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB " f"(saved {saving:.1f}%)")
 
         if not audio_ok:
             log(
@@ -300,6 +318,18 @@ def convert_to_x265(input_path: Path) -> bool:
         if not (audio_ok and sub_ok):
             log(
                 f"  [✗] Stream count mismatch — kept for inspection: {output_path.name}"
+            )
+            return False
+
+        # Verify output DURATION matches the source: a correct stream count does
+        # not guarantee a complete encode (a truncated output keeps all streams
+        # but loses time). Refuse to delete the original when durations diverge.
+        in_dur = get_duration(input_path)
+        out_dur = get_duration(output_path)
+        if in_dur and out_dur and abs(in_dur - out_dur) > max(1.0, 0.01 * in_dur):
+            log(
+                f"  [✗] Duration mismatch ({in_dur:.0f}s → {out_dur:.0f}s) — "
+                f"likely truncated, original kept: {output_path.name}"
             )
             return False
 
