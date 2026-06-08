@@ -98,6 +98,10 @@ CONVERT_AUDIO_BITRATE = "192k"
 # désactiver.
 CONVERT_SCAN_CACHE = ".scan-cache.json"
 
+# Nombre de sondes ffprobe parallèles pendant la phase de SCAN des codecs
+# (I/O-bound). N'affecte pas l'encodage (séquentiel sur le GPU). 1 = séquentiel.
+CONVERT_SCAN_WORKERS = 8
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 02 — enrich-movies-photos-with-date
 #   Complète les dates de prise de vue manquantes (EXIF photos, creation_time
@@ -126,6 +130,9 @@ COMPRESS_OUTPUT = str(_PROJECT_DIR / "output" / "gphotos")  # arborescence de so
 COMPRESS_MAX_PHOTO_SIZE = 2048  # côté le plus long borné à cette valeur (px)
 COMPRESS_JPEG_QUALITY = 95  # qualité JPEG (0–100)
 COMPRESS_VIDEO_HEIGHT = 720  # hauteur max des vidéos (px) ; qualité = VIDEO_CQ
+# Compression PHOTO parallèle (I/O + Pillow). Les vidéos restent séquentielles
+# (GPU NVENC partagé). 1 = séquentiel (comportement d'origine).
+COMPRESS_PHOTO_WORKERS = 8
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 04 — upload-to-gphotos (rclone)

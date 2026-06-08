@@ -77,6 +77,11 @@ CONVERT_SKIP_SUFFIX = "_x265"  # fichiers déjà convertis (ignorés au scan)
 # (gitignoré) ; mettre None pour désactiver le cache.
 CONVERT_SCAN_CACHE = ".scan-cache.json"
 
+# Nombre de sondes ffprobe parallèles pendant la phase de SCAN (I/O-bound : les
+# threads se recouvrent bien). N'affecte pas l'encodage (séquentiel sur le GPU).
+# 1 = scan séquentiel (comportement d'origine).
+CONVERT_SCAN_WORKERS = 8
+
 # Downscale optionnel : résolution MAX de sortie. Tout fichier dépassant cette
 # résolution est ré-encodé (MÊME s'il est déjà HEVC) en le réduisant pour tenir
 # dans la boîte correspondante (aspect conservé, jamais d'upscale). Le HDR 10-bit

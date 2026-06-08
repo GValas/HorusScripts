@@ -29,6 +29,7 @@ import subprocess
 import sys
 import logging
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
@@ -60,6 +61,7 @@ SCAN_CACHE_PATH = (
     if getattr(config, "CONVERT_SCAN_CACHE", None)
     else None
 )
+SCAN_WORKERS = getattr(config, "CONVERT_SCAN_WORKERS", 1)  # sondes // au scan
 # ───────────────────────────────────────────────────────────
 
 
@@ -171,6 +173,39 @@ def get_video_codec_cached(path: Path, cache: dict) -> str | None:
     codec = get_video_codec(path)
     cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "codec": codec}
     return codec
+
+
+def prewarm_codecs(candidates: list, cache: dict) -> None:
+    """Pré-sonde en parallèle (ffprobe) le codec des fichiers absents du cache.
+
+    ffprobe est I/O-bound : les threads se recouvrent. Les écritures du cache se
+    font dans le thread principal (ex.map yield séquentiel). L'encodage qui suit
+    reste séquentiel (GPU partagé)."""
+    if SCAN_WORKERS <= 1 or not candidates:
+        return
+    misses = []
+    for f in candidates:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        ent = cache.get(str(f))
+        if not (
+            ent
+            and ent.get("mtime") == int(st.st_mtime)
+            and ent.get("size") == st.st_size
+        ):
+            misses.append((f, st))
+    if not misses:
+        return
+
+    def work(item):
+        f, st = item
+        return str(f), st, get_video_codec(f)
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        for key, st, codec in ex.map(work, misses):
+            cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "codec": codec}
 
 
 def enough_space(target_dir: Path, needed: int) -> bool:
@@ -552,6 +587,7 @@ def main():
     skipped = encoded = remuxed = errors = already_h265 = 0
     start_total = datetime.now()
     scan_cache = load_scan_cache(SCAN_CACHE_PATH)
+    prewarm_codecs(candidates, scan_cache)  # pré-sonde // les codecs (cache-miss)
 
     for i, input_file in enumerate(candidates, 1):
         relative = input_file.relative_to(SOURCE_DIR)

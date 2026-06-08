@@ -25,6 +25,7 @@ import shutil
 import logging
 import subprocess
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -56,6 +57,9 @@ VIDEO_CQ = config.VIDEO_CQ
 VIDEO_PRESET = config.VIDEO_PRESET
 PHOTO_EXTS = config.PHOTO_EXT
 VIDEO_EXTS = config.VIDEO_EXT
+PHOTO_WORKERS = getattr(
+    config, "COMPRESS_PHOTO_WORKERS", 1
+)  # photos // (vidéos en série)
 
 ##################################################################
 
@@ -297,6 +301,8 @@ def main() -> int:
 
     photos = videos = skipped = errors = already = collisions = excluded = 0
     seen_targets: set[str] = set()
+    photo_tasks: list[tuple[Path, Path]] = []  # (src, dst) à compresser en //
+    video_tasks: list[tuple[Path, Path]] = []  # (src, dst) en série (GPU)
 
     for src in sorted(source_root.rglob("*")):
         if not src.is_file():
@@ -332,17 +338,34 @@ def main() -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
 
         if kind == "photo":
-            ok = compress_photo(src, dst, logger)
-            if ok:
+            photo_tasks.append((src, dst))
+        else:
+            video_tasks.append((src, dst))
+
+    # Photos : compression en parallèle (I/O + Pillow se recouvrent bien). Les
+    # compteurs sont agrégés ici, dans le thread principal (résultats yieldés par
+    # ex.map), donc pas d'accès concurrent. Chaque tâche écrit une cible distincte.
+    if PHOTO_WORKERS > 1 and len(photo_tasks) > 1:
+        with ThreadPoolExecutor(max_workers=PHOTO_WORKERS) as ex:
+            for ok in ex.map(lambda t: compress_photo(t[0], t[1], logger), photo_tasks):
+                if ok:
+                    photos += 1
+                else:
+                    errors += 1
+    else:
+        for src, dst in photo_tasks:
+            if compress_photo(src, dst, logger):
                 photos += 1
             else:
                 errors += 1
+
+    # Vidéos : séquentiel (un seul encodeur NVENC partagé — paralléliser
+    # n'accélère pas et sature le GPU).
+    for src, dst in video_tasks:
+        if compress_video(src, dst, logger):
+            videos += 1
         else:
-            ok = compress_video(src, dst, logger)
-            if ok:
-                videos += 1
-            else:
-                errors += 1
+            errors += 1
 
     logger.info("\n" + "=" * 64)
     logger.info("BILAN")

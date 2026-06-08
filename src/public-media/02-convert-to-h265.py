@@ -2,6 +2,7 @@ import subprocess
 import json
 import shutil
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -48,6 +49,7 @@ SCAN_CACHE_PATH = (
     if getattr(config, "CONVERT_SCAN_CACHE", None)
     else None
 )
+SCAN_WORKERS = getattr(config, "CONVERT_SCAN_WORKERS", 1)  # sondes // au scan
 
 # Résolution max de sortie -> boîte (largeur, hauteur) à ne pas dépasser.
 # CONVERT_MAX_RESOLUTION (00-config.py) vaut une de ces clés, ou None (pas de
@@ -222,6 +224,47 @@ def probe_for_scan(f: Path, cache: dict) -> tuple:
         "height": info["height"],
     }
     return info["codec"], info["width"], info["height"]
+
+
+def prewarm_scan(candidates: list, cache: dict) -> None:
+    """Pré-sonde en parallèle (ffprobe) les fichiers absents/périmés du cache.
+
+    ffprobe est I/O-bound : les threads se recouvrent bien. Les écritures du
+    cache se font ici, dans le thread principal (ex.map yield séquentiel) — pas
+    d'accès concurrent au dict. La décision de scan reste ensuite séquentielle
+    (ordre des logs stable), avec des hits de cache garantis.
+    """
+    if SCAN_WORKERS <= 1 or not candidates:
+        return
+    misses = []
+    for f in candidates:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        ent = cache.get(str(f))
+        if not (
+            ent
+            and ent.get("mtime") == int(st.st_mtime)
+            and ent.get("size") == st.st_size
+        ):
+            misses.append((f, st))
+    if not misses:
+        return
+
+    def work(item):
+        f, st = item
+        return str(f), st, get_video_info(f)
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        for key, st, info in ex.map(work, misses):
+            cache[key] = {
+                "mtime": int(st.st_mtime),
+                "size": st.st_size,
+                "codec": info["codec"],
+                "width": info["width"],
+                "height": info["height"],
+            }
 
 
 def enough_space(target_dir: Path, needed: int) -> bool:
@@ -452,6 +495,9 @@ def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
     ]
 
     log(f"[*] Found {len(candidates)} video files to check\n")
+
+    # Pré-sonde en parallèle (cache-miss) avant la décision séquentielle.
+    prewarm_scan(candidates, cache)
 
     to_convert = []
     for f in candidates:
