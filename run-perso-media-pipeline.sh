@@ -16,6 +16,8 @@
 #   ./run-perso-media-pipeline.sh           # demande confirmation si DRY_RUN=False
 #   ./run-perso-media-pipeline.sh -y        # sans confirmation
 #   ./run-perso-media-pipeline.sh 03 04     # ne lance que ces étapes (sous-ensemble)
+#   ./run-perso-media-pipeline.sh --dry-run # force la simulation (ignore 00-config)
+#   ./run-perso-media-pipeline.sh --real    # force l'exécution réelle
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -43,17 +45,28 @@ OUT="$(read_cfg COMPRESS_OUTPUT)"
 
 # Étapes demandées (défaut : toutes).
 ASSUME_YES=0
+DRY_OVERRIDE=""
 STEPS=()
 for a in "$@"; do
   case "$a" in
     -y|--yes) ASSUME_YES=1 ;;
+    --dry-run) DRY_OVERRIDE=1 ;;
+    --real) DRY_OVERRIDE=0 ;;
     01|02|03|04) STEPS+=("$a") ;;
-    *) echo "Argument inconnu : $a (attendu: -y, ou 01/02/03/04)" >&2; exit 2 ;;
+    *) echo "Argument inconnu : $a (attendu: -y, --dry-run, --real, ou 01/02/03/04)" >&2; exit 2 ;;
   esac
 done
 [ ${#STEPS[@]} -eq 0 ] && STEPS=(01 02 03 04)
 
 DRY_RUN="$(read_cfg DRY_RUN)"
+# --dry-run/--real priment sur 00-config.py. On calcule la valeur effective et on
+# la transmet aux conteneurs via PIPELINE_DRY_RUN (1/0), source de vérité unique
+# pour ce run (les scripts l'honorent au-dessus de 00-config.py).
+case "$DRY_OVERRIDE" in
+  1) DRY_RUN=True ;;
+  0) DRY_RUN=False ;;
+esac
+EFFECTIVE_DRY=$([ "$DRY_RUN" = "True" ] && echo 1 || echo 0)
 
 echo "════════════════════════════════════════════════════════════"
 echo " Pipeline perso-media"
@@ -74,7 +87,7 @@ if [ "$DRY_RUN" != "True" ] && [ "$ASSUME_YES" -ne 1 ]; then
 fi
 
 # Bases de lancement docker communes.
-BASE=(docker run --rm --user "$USERSPEC" -v "$PHOTOS_SRC:$PHOTOS_SRC" -v "$SCRIPTS_DIR:/work" -w /work)
+BASE=(docker run --rm --user "$USERSPEC" -e "PIPELINE_DRY_RUN=$EFFECTIVE_DRY" -v "$PHOTOS_SRC:$PHOTOS_SRC" -v "$SCRIPTS_DIR:/work" -w /work)
 GPU=(--gpus all -e NVIDIA_DRIVER_CAPABILITIES=all)
 
 run_step() {  # $1 = libellé

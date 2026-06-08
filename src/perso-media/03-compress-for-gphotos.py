@@ -50,6 +50,9 @@ _spec.loader.exec_module(config)
 SOURCE = config.PHOTOS_SRC
 OUTPUT = config.COMPRESS_OUTPUT
 DRY_RUN = config.DRY_RUN
+_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
+if _dr is not None:
+    DRY_RUN = _dr == "1"
 MAX_PHOTO_SIZE = config.COMPRESS_MAX_PHOTO_SIZE
 JPEG_QUALITY = config.COMPRESS_JPEG_QUALITY
 VIDEO_HEIGHT = config.COMPRESS_VIDEO_HEIGHT

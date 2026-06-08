@@ -1,3 +1,4 @@
+import os
 import subprocess
 import json
 import shutil
@@ -43,6 +44,11 @@ PRESET = config.CONVERT_PRESET  # préréglage NVENC (p1 → p7)
 EXTENSIONS = config.CONVERT_EXTENSIONS  # conteneurs vidéo scannés
 SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX  # fichiers déjà convertis (ignorés)
 DRY_RUN = config.DRY_RUN  # True = simulation seule
+# Surcharge CLI : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
+# --real), prime sur 00-config.py.
+_dr = os.environ.get("PIPELINE_DRY_RUN")
+if _dr is not None:
+    DRY_RUN = _dr == "1"
 # Cache de scan (codec/dimensions par fichier) ; None = désactivé.
 SCAN_CACHE_PATH = (
     Path(__file__).with_name(config.CONVERT_SCAN_CACHE)

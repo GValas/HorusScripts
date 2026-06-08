@@ -44,6 +44,9 @@ _spec.loader.exec_module(config)
 
 SOURCE_DIR = Path(config.PHOTOS_SRC)
 DRY_RUN = config.DRY_RUN
+_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
+if _dr is not None:
+    DRY_RUN = _dr == "1"
 RENAME_JPEG = config.CONVERT_RENAME_JPEG
 HEIC_TO_JPG = config.CONVERT_HEIC_TO_JPG
 HEIC_EXTENSIONS = config.CONVERT_HEIC_EXTENSIONS

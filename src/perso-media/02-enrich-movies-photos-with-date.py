@@ -68,6 +68,9 @@ SOURCE = config.PHOTOS_SRC
 EXPORT_CSV = config.ENRICH_EXPORT_CSV
 EXPORT_JSON = config.ENRICH_EXPORT_JSON
 DRY_RUN = config.DRY_RUN
+_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
+if _dr is not None:
+    DRY_RUN = _dr == "1"
 
 PHOTO_EXTENSIONS = config.PHOTO_EXT
 VIDEO_EXTENSIONS = config.VIDEO_EXT

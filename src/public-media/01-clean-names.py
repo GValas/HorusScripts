@@ -23,6 +23,13 @@ ROOTS = config.INPUT_FOLDERS  # dossiers parcourus récursivement
 DRY_RUN = config.DRY_RUN  # True = simulation, False = renommage réel
 TECH_WORDS = config.CLEAN_TECH_WORDS  # mots techniques retirés des noms
 
+# Surcharge CLI : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
+# --real), prime sur 00-config.py — pratique pour un run ponctuel sans éditer
+# (ni risquer d'oublier de remettre) la config.
+_dr = os.environ.get("PIPELINE_DRY_RUN")
+if _dr is not None:
+    DRY_RUN = _dr == "1"
+
 ##################################################################
 
 RE_EPISODE = re.compile(r"^(s\d{1,2}e\d{1,2}|\d{1,2}x\d{1,2}$)")
