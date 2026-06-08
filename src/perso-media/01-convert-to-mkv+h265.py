@@ -43,6 +43,9 @@ _spec.loader.exec_module(config)
 SOURCE_DIR = Path(config.PHOTOS_SRC)
 DRY_RUN = config.DRY_RUN
 RENAME_JPEG = config.CONVERT_RENAME_JPEG
+HEIC_TO_JPG = config.CONVERT_HEIC_TO_JPG
+HEIC_EXTENSIONS = config.CONVERT_HEIC_EXTENSIONS
+JPEG_QUALITY = config.CONVERT_JPEG_QUALITY
 EXTENSIONS = config.CONVERT_EXTENSIONS
 OUTPUT_SUFFIX = config.CONVERT_OUTPUT_SUFFIX
 MIN_PLAUSIBLE_YEAR = config.MIN_PLAUSIBLE_YEAR
@@ -364,6 +367,81 @@ def rename_jpeg_to_jpg(root: Path, dry_run: bool, logger: logging.Logger) -> Non
     )
 
 
+def convert_heic_to_jpg(root: Path, dry_run: bool, logger: logging.Logger) -> None:
+    """Convertit les photos HEIC/HEIF -> JPG (décodage Pillow + pillow-heif).
+
+    Les iPhones récents enregistrent en HEIC, format ignoré par le reste du
+    pipeline (02/03 ne traitent que .jpg). On décode en JPEG en CONSERVANT l'EXIF
+    (orientation, date de prise de vue) pour que 02 puisse l'exploiter, sans
+    jamais écraser un .jpg de même nom, puis on supprime l'original HEIC si la
+    conversion a réussi. No-op (avec avertissement) si pillow-heif est absent.
+    """
+    heics = [
+        p
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in HEIC_EXTENSIONS
+    ]
+    if not heics:
+        return
+
+    try:
+        from PIL import Image
+        from pillow_heif import register_heif_opener
+
+        register_heif_opener()
+    except Exception as e:  # noqa: BLE001 — dépendance optionnelle
+        logger.warning(
+            "Conversion HEIC impossible (pillow-heif absent ?) : %s — "
+            "%d fichier(s) laissé(s) tel quel",
+            e,
+            len(heics),
+        )
+        return
+
+    logger.info("Conversion HEIC -> JPG : %d fichier(s) trouvé(s)", len(heics))
+    converted = collisions = errors = 0
+    for src in sorted(heics):
+        target = src.with_suffix(".jpg")
+        if target.exists():
+            logger.warning(
+                "    collision, ignoré : %s (%s existe déjà)", src.name, target.name
+            )
+            collisions += 1
+            continue
+        if dry_run:
+            logger.info("    [DRY RUN] %s -> %s", src.name, target.name)
+            converted += 1
+            continue
+        try:
+            with Image.open(src) as img:
+                exif = img.info.get("exif")  # EXIF d'origine (orientation, date…)
+                img = img.convert("RGB")  # JPEG n'accepte ni alpha ni palette
+                save_kwargs = {"quality": JPEG_QUALITY, "optimize": True}
+                if exif:
+                    save_kwargs["exif"] = exif
+                img.save(target, "JPEG", **save_kwargs)
+            # Reporte la mtime de l'original (chronologie) puis supprime le HEIC.
+            st = src.stat()
+            os.utime(target, (st.st_atime, st.st_mtime))
+            src.unlink()
+            converted += 1
+        except Exception as e:  # noqa: BLE001 — on logue et on continue le batch
+            logger.error("    erreur %s : %s", src.name, e)
+            if target.exists():
+                try:
+                    target.unlink()  # ne pas laisser de JPEG partiel
+                except OSError:
+                    pass
+            errors += 1
+    logger.info(
+        "Conversion HEIC -> JPG : %d converti(s)%s, %d collision(s), %d erreur(s)",
+        converted,
+        " (simulé)" if dry_run else "",
+        collisions,
+        errors,
+    )
+
+
 def main():
     if not SOURCE_DIR.is_dir():
         print(f"Erreur : dossier introuvable — {SOURCE_DIR}")
@@ -384,7 +462,10 @@ def main():
         logger.info("Originaux  : supprimés après conversion réussie")
     logger.info("=" * 56)
 
-    # Normalisation des photos (indépendante de ffmpeg) : .jpeg -> .jpg.
+    # Normalisation des photos (indépendante de ffmpeg) : HEIC -> .jpg puis
+    # .jpeg -> .jpg, pour que toute la bibliothèque photo soit en .jpg.
+    if HEIC_TO_JPG:
+        convert_heic_to_jpg(SOURCE_DIR, DRY_RUN, logger)
     if RENAME_JPEG:
         rename_jpeg_to_jpg(SOURCE_DIR, DRY_RUN, logger)
 

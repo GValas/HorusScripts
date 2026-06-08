@@ -47,7 +47,7 @@ VIDEO_EXT = ".mkv"
 
 # Encodage vidéo H.265 sur GPU NVIDIA (NVENC), commun à 01 (conversion) et
 # 03 (compression).
-VIDEO_CQ = 28        # qualité NVENC : + bas = mieux (24–30 conseillé)
+VIDEO_CQ = 28  # qualité NVENC : + bas = mieux (24–30 conseillé)
 VIDEO_PRESET = "p4"  # préréglage NVENC : p1 (rapide) → p7 (qualité)
 
 # Bornes d'années pour juger une date « plausible » : écarte les dates epoch
@@ -62,16 +62,34 @@ MAX_PLAUSIBLE_YEAR = 2100
 #   .jpeg -> .jpg. Conserve les tags existants, sans inférer de date (rôle de 02).
 # ══════════════════════════════════════════════════════════════════════════════
 
-CONVERT_RENAME_JPEG = True   # normaliser aussi les photos : .jpeg -> .jpg
+CONVERT_RENAME_JPEG = True  # normaliser aussi les photos : .jpeg -> .jpg
+CONVERT_HEIC_TO_JPG = True  # convertir les photos HEIC/HEIF (iPhone) -> .jpg
+CONVERT_HEIC_EXTENSIONS = {".heic", ".heif"}  # extensions HEIC reconnues
+CONVERT_JPEG_QUALITY = 95  # qualité JPEG du HEIC décodé (0–100)
 # Conteneurs d'entrée à scanner (le .mkv est ajouté au scan par le script lui-
 # même, pour ré-encoder un .mkv non-H.265 ou ignorer un .mkv déjà H.265).
 CONVERT_EXTENSIONS = {
-    ".mov", ".mp4", ".webm", ".wmv", ".mpeg", ".mpg", ".rm", ".rmvb",
-    ".3gp", ".avi", ".divx", ".asf", ".vob",
-    ".m2ts", ".mts", ".flv", ".f4v", ".m4v",
+    ".mov",
+    ".mp4",
+    ".webm",
+    ".wmv",
+    ".mpeg",
+    ".mpg",
+    ".rm",
+    ".rmvb",
+    ".3gp",
+    ".avi",
+    ".divx",
+    ".asf",
+    ".vob",
+    ".m2ts",
+    ".mts",
+    ".flv",
+    ".f4v",
+    ".m4v",
 }
-CONVERT_OUTPUT_SUFFIX = VIDEO_EXT   # conteneur de sortie (= .mkv commun)
-CONVERT_AUDIO_CODEC = "aac"         # ré-encodage audio (archivage)
+CONVERT_OUTPUT_SUFFIX = VIDEO_EXT  # conteneur de sortie (= .mkv commun)
+CONVERT_AUDIO_CODEC = "aac"  # ré-encodage audio (archivage)
 CONVERT_AUDIO_BITRATE = "192k"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -81,8 +99,8 @@ CONVERT_AUDIO_BITRATE = "192k"
 #   faite en amont par 01.
 # ══════════════════════════════════════════════════════════════════════════════
 
-ENRICH_EXPORT_CSV = "rapport.csv"   # rapport des fichiers scannés ; None = aucun
-ENRICH_EXPORT_JSON = None           # rapport JSON optionnel ; None = aucun
+ENRICH_EXPORT_CSV = "rapport.csv"  # rapport des fichiers scannés ; None = aucun
+ENRICH_EXPORT_JSON = None  # rapport JSON optionnel ; None = aucun
 # Clés de tags de date reconnues dans la sortie ffprobe (conteneur MKV),
 # insensible à la casse.
 ENRICH_DATE_TAG_KEYS = {
@@ -100,8 +118,8 @@ ENRICH_DATE_TAG_KEYS = {
 
 COMPRESS_OUTPUT = str(_PROJECT_DIR / "output" / "gphotos")  # arborescence de sortie
 COMPRESS_MAX_PHOTO_SIZE = 2048  # côté le plus long borné à cette valeur (px)
-COMPRESS_JPEG_QUALITY = 95      # qualité JPEG (0–100)
-COMPRESS_VIDEO_HEIGHT = 720     # hauteur max des vidéos (px) ; qualité = VIDEO_CQ
+COMPRESS_JPEG_QUALITY = 95  # qualité JPEG (0–100)
+COMPRESS_VIDEO_HEIGHT = 720  # hauteur max des vidéos (px) ; qualité = VIDEO_CQ
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 04 — upload-to-gphotos (rclone)
@@ -111,13 +129,13 @@ COMPRESS_VIDEO_HEIGHT = 720     # hauteur max des vidéos (px) ; qualité = VIDE
 #   (gitignoré, hors de ce fichier). L'ancien script Python est archivé/.
 # ══════════════════════════════════════════════════════════════════════════════
 
-UPLOAD_REMOTE = "gphotos"   # nom du remote rclone (défini dans env/rclone.conf)
-UPLOAD_TRANSFERS = 8        # uploads parallèles (rclone --transfers) ; gain principal
-UPLOAD_TPSLIMIT = 15        # plafond de requêtes/s vers l'API (rclone --tpslimit) ;
+UPLOAD_REMOTE = "gphotos"  # nom du remote rclone (défini dans env/rclone.conf)
+UPLOAD_TRANSFERS = 8  # uploads parallèles (rclone --transfers) ; gain principal
+UPLOAD_TPSLIMIT = 15  # plafond de requêtes/s vers l'API (rclone --tpslimit) ;
 #   au-delà de ~15-20, Google renvoie des 429 (rate limit) -> rclone back-off,
 #   souvent plus lent. La vraie limite est le quota Google Photos
 #   (~10 000 requêtes API/jour par projet OAuth) + le throttling serveur.
-UPLOAD_RETRIES = 1          # rclone --retries : nb de passes globales. 1 = échec
+UPLOAD_RETRIES = 1  # rclone --retries : nb de passes globales. 1 = échec
 #   RAPIDE quand le quota journalier Google (~10 000 req/jour) est atteint, au
 #   lieu de reboucler 3× pendant des heures pour rien. La reprise se fait au run
 #   suivant (rclone saute ce qui est déjà uploadé). Monter à 3 pour plus de
