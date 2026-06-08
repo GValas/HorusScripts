@@ -41,7 +41,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 ##################################################################
 
 _spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py"))
+    "pipeline_config", Path(__file__).with_name("00-config.py")
+)
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
@@ -82,6 +83,18 @@ def setup_logging() -> logging.Logger:
     return logging.getLogger(__name__)
 
 
+def enough_space(target_dir: Path, needed: int) -> bool:
+    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
+
+    Indéterminé (erreur OS) -> True : on ne bloque pas une compression par excès
+    de prudence si l'espace libre n'a pas pu être lu.
+    """
+    try:
+        return shutil.disk_usage(target_dir).free >= needed
+    except OSError:
+        return True
+
+
 def copy_mtime(src: Path, dst: Path) -> None:
     """Reporte la date de modif. de la source sur la cible (chronologie GPhotos)."""
     try:
@@ -99,12 +112,18 @@ def probe_creation_time(src: Path) -> str | None:
     try:
         proc = subprocess.run(
             [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
                 "-show_entries",
                 "format_tags=creation_time:stream_tags=creation_time",
                 str(src),
             ],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
     except (FileNotFoundError, subprocess.SubprocessError, OSError):
         return None
@@ -126,6 +145,11 @@ def probe_creation_time(src: Path) -> str | None:
 
 def compress_photo(src: Path, dst: Path, logger: logging.Logger) -> bool:
     """Redimensionne (max MAX_PHOTO_SIZE) et ré-encode en JPEG, EXIF conservé."""
+    if not DRY_RUN and not enough_space(
+        dst.parent, src.stat().st_size + 50 * 1024 * 1024
+    ):
+        logger.error("Espace disque insuffisant pour la photo %s — ignorée", src.name)
+        return False
     try:
         with Image.open(src) as img:
             exif = img.info.get("exif")  # bytes EXIF d'origine (orientation, date…)
@@ -163,6 +187,10 @@ def compress_video(src: Path, dst: Path, logger: logging.Logger) -> bool:
         logger.info("[DRY RUN] VIDEO  %s  →  %s", src.name, dst.name)
         return True
 
+    if not enough_space(dst.parent, src.stat().st_size + 100 * 1024 * 1024):
+        logger.error("Espace disque insuffisant pour la vidéo %s — ignorée", src.name)
+        return False
+
     # Date de prise de vue : on la propage à la sortie pour que Google Photos
     # range la vidéo au bon endroit dans la chronologie (le ré-encodage perd
     # sinon le creation_time de la source).
@@ -172,21 +200,36 @@ def compress_video(src: Path, dst: Path, logger: logging.Logger) -> bool:
     # auto en multiple de 2 (-2) comme l'exige le codec.
     vf = f"scale=-2:'min({VIDEO_HEIGHT},ih)'"
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(src),
-        "-map_metadata", "0",       # conserve les métadonnées globales de la source
-        "-vf", vf,
-        "-c:v", "hevc_nvenc",       # encodage GPU NVIDIA (NVENC)
-        "-rc", "vbr",
-        "-cq", str(VIDEO_CQ),
-        "-qmin", str(VIDEO_CQ),
-        "-qmax", str(VIDEO_CQ),
-        "-b:v", "0",
-        "-preset", VIDEO_PRESET,
-        "-tag:v", "hvc1",          # lecture H.265 sur Apple / web
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-map_metadata",
+        "0",  # conserve les métadonnées globales de la source
+        "-vf",
+        vf,
+        "-c:v",
+        "hevc_nvenc",  # encodage GPU NVIDIA (NVENC)
+        "-rc",
+        "vbr",
+        "-cq",
+        str(VIDEO_CQ),
+        "-qmin",
+        str(VIDEO_CQ),
+        "-qmax",
+        str(VIDEO_CQ),
+        "-b:v",
+        "0",
+        "-preset",
+        VIDEO_PRESET,
+        "-tag:v",
+        "hvc1",  # lecture H.265 sur Apple / web
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
     ]
     if creation_time:
         cmd += ["-metadata", f"creation_time={creation_time}"]
@@ -240,8 +283,12 @@ def main() -> int:
     logger.info("Source  : %s", source_root)
     logger.info("Sortie  : %s", output_root)
     logger.info("Photos  : .jpg, max %dpx, JPEG q%d", MAX_PHOTO_SIZE, JPEG_QUALITY)
-    logger.info("Vidéos  : .mkv -> %dp, hevc_nvenc CQ %d, preset %s",
-                VIDEO_HEIGHT, VIDEO_CQ, VIDEO_PRESET)
+    logger.info(
+        "Vidéos  : .mkv -> %dp, hevc_nvenc CQ %d, preset %s",
+        VIDEO_HEIGHT,
+        VIDEO_CQ,
+        VIDEO_PRESET,
+    )
     logger.info("=" * 64)
 
     if not source_root.is_dir():

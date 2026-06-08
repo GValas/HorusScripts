@@ -23,6 +23,7 @@ Prérequis : ffmpeg + ffprobe installés et accessibles dans le PATH
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import logging
@@ -122,6 +123,18 @@ def get_video_codec(path: Path) -> str | None:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout.strip() or None
+
+
+def enough_space(target_dir: Path, needed: int) -> bool:
+    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
+
+    Indéterminé (erreur OS) -> True : on ne bloque pas une conversion par excès
+    de prudence si l'espace libre n'a pas pu être lu.
+    """
+    try:
+        return shutil.disk_usage(target_dir).free >= needed
+    except OSError:
+        return True
 
 
 def get_duration(path: Path) -> float | None:
@@ -491,6 +504,17 @@ def main():
             if in_place
             else output_file
         )
+
+        # Garde-fou espace disque : le fichier converti coexiste avec l'original
+        # (temp en sur-place, ou .mkv à côté) jusqu'au remplacement. On exige au
+        # moins la taille de la source libre + une marge, sinon on saute proprement.
+        if not enough_space(target.parent, size + 200 * 1024 * 1024):
+            logger.error(
+                "    ✗ Espace disque insuffisant — fichier ignoré : %s",
+                input_file.name,
+            )
+            skipped += 1
+            continue
 
         t0 = datetime.now()
         if action == "encode":

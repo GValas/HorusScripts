@@ -1,5 +1,6 @@
 import subprocess
 import json
+import shutil
 import importlib.util
 from datetime import datetime
 from pathlib import Path
@@ -167,6 +168,18 @@ def get_duration(filepath: Path) -> float | None:
         return None
 
 
+def enough_space(target_dir: Path, needed: int) -> bool:
+    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
+
+    Indéterminé (erreur OS) -> True : on ne bloque pas une conversion par excès
+    de prudence si l'espace libre n'a pas pu être lu.
+    """
+    try:
+        return shutil.disk_usage(target_dir).free >= needed
+    except OSError:
+        return True
+
+
 def convert_to_x265(input_path: Path) -> bool:
     """Convert a file to x265 using NVENC, preserving all streams."""
     output_path = input_path.with_name(input_path.stem + "_x265.mkv")
@@ -200,6 +213,14 @@ def convert_to_x265(input_path: Path) -> bool:
     if DRY_RUN:
         log(f"  [DRY-RUN] Would convert to: {output_path.name}")
         return True
+
+    # Disk-space guard: the new output coexists with the original until it is
+    # replaced, so require at least the source size (HEVC is usually smaller)
+    # plus a margin. Skip the file cleanly rather than fill the volume mid-batch.
+    needed = input_path.stat().st_size + 200 * 1024 * 1024
+    if not enough_space(output_path.parent, needed):
+        log(f"  [✗] Not enough free disk space to convert {input_path.name} — skipped")
+        return False
 
     # Build an explicit stream map instead of "-map 0". Real-world files carry
     # streams that break the conversion: subtitle streams ffmpeg can't identify
