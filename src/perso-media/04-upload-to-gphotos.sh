@@ -32,6 +32,12 @@ m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(getattr(m, 
 
 SRC="$(read_cfg COMPRESS_OUTPUT)"   # = dossier de sortie produit par 03
 DRY_RUN="$(read_cfg DRY_RUN)"
+# Surcharge CLI : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
+# --real), prime sur 00-config.py.
+case "${PIPELINE_DRY_RUN:-}" in
+  1) DRY_RUN=True ;;
+  0) DRY_RUN=False ;;
+esac
 REMOTE="$(read_cfg UPLOAD_REMOTE)"
 TRANSFERS="$(read_cfg UPLOAD_TRANSFERS)"
 TPSLIMIT="$(read_cfg UPLOAD_TPSLIMIT)"

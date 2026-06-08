@@ -1,9 +1,11 @@
+import os
 import subprocess
 import json
+import shutil
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-
 
 # Codes couleur ANSI : succès en vert, erreurs en rouge, avertissements en jaune.
 GREEN = "\033[92m"
@@ -12,35 +14,63 @@ YELLOW = "\033[93m"
 RESET = "\033[0m"
 
 
+# Fichier log (ouvert dans main) : trace persistante du run, en plus de stdout.
+LOG_FILE_HANDLE = None
+
+# Cumul des tailles avant/après pour le bilan « espace économisé » du run.
+STATS = {"old_bytes": 0, "new_bytes": 0}
+
+
 def log(msg: str = "") -> None:
     """Affiche un message en préfixant chaque ligne d'un timestamp.
 
-    Colore automatiquement chaque ligne : vert pour les succès ([✓]),
-    rouge pour les erreurs ([✗]), jaune pour les avertissements ([!]).
+    Colore automatiquement chaque ligne sur stdout : vert pour les succès ([✓]),
+    rouge pour les erreurs ([✗]), jaune pour les avertissements ([!]). Écrit
+    aussi la ligne brute (sans codes couleur) dans le fichier log si ouvert.
     """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     for line in str(msg).split("\n"):
+        colored = line
         if "[✗]" in line:
-            line = f"{RED}{line}{RESET}"
+            colored = f"{RED}{line}{RESET}"
         elif "[✓]" in line:
-            line = f"{GREEN}{line}{RESET}"
+            colored = f"{GREEN}{line}{RESET}"
         elif "[!]" in line:
-            line = f"{YELLOW}{line}{RESET}"
-        print(f"{ts} | {line}")
+            colored = f"{YELLOW}{line}{RESET}"
+        print(f"{ts} | {colored}")
+        if LOG_FILE_HANDLE is not None:
+            try:
+                LOG_FILE_HANDLE.write(f"{ts} | {line}\n")
+                LOG_FILE_HANDLE.flush()
+            except OSError:
+                pass
 
 
 # ── Configuration : tout est dans 00-config.py (COMMUN + CONVERT_*) ───────────
 _spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py"))
+    "pipeline_config", Path(__file__).with_name("00-config.py")
+)
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-INPUT_FOLDERS = config.INPUT_FOLDERS       # dossiers scannés récursivement
-CQ = config.CONVERT_CQ                      # qualité NVENC (+ bas = mieux)
-PRESET = config.CONVERT_PRESET             # préréglage NVENC (p1 → p7)
-EXTENSIONS = config.CONVERT_EXTENSIONS     # conteneurs vidéo scannés
-SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX   # fichiers déjà convertis (ignorés)
-DRY_RUN = config.DRY_RUN                    # True = simulation seule
+INPUT_FOLDERS = config.INPUT_FOLDERS  # dossiers scannés récursivement
+CQ = config.CONVERT_CQ  # qualité NVENC (+ bas = mieux)
+PRESET = config.CONVERT_PRESET  # préréglage NVENC (p1 → p7)
+EXTENSIONS = config.CONVERT_EXTENSIONS  # conteneurs vidéo scannés
+SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX  # fichiers déjà convertis (ignorés)
+DRY_RUN = config.DRY_RUN  # True = simulation seule
+# Surcharge CLI : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
+# --real), prime sur 00-config.py.
+_dr = os.environ.get("PIPELINE_DRY_RUN")
+if _dr is not None:
+    DRY_RUN = _dr == "1"
+# Cache de scan (codec/dimensions par fichier) ; None = désactivé.
+SCAN_CACHE_PATH = (
+    Path(__file__).with_name(config.CONVERT_SCAN_CACHE)
+    if getattr(config, "CONVERT_SCAN_CACHE", None)
+    else None
+)
+SCAN_WORKERS = getattr(config, "CONVERT_SCAN_WORKERS", 1)  # sondes // au scan
 
 # Résolution max de sortie -> boîte (largeur, hauteur) à ne pas dépasser.
 # CONVERT_MAX_RESOLUTION (00-config.py) vaut une de ces clés, ou None (pas de
@@ -146,6 +176,130 @@ def get_video_info(filepath: Path) -> dict:
         }
 
 
+def get_duration(filepath: Path) -> float | None:
+    """Durée du fichier en secondes (ffprobe format.duration) ; None si indéterminée."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_entries",
+        "format=duration",
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        data = json.loads(result.stdout)
+        dur = (data.get("format") or {}).get("duration")
+        return float(dur) if dur is not None else None
+    except Exception:
+        return None
+
+
+def load_scan_cache(path: Path | None) -> dict:
+    """Charge le cache de scan JSON (clé = chemin) ; {} si absent/désactivé."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_scan_cache(path: Path | None, cache: dict) -> None:
+    """Écrit le cache de scan (best-effort : une erreur d'écriture est ignorée)."""
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def probe_for_scan(f: Path, cache: dict) -> tuple:
+    """(codec, width, height) pour la décision de scan, avec cache (mtime+size).
+
+    Sur hit de cache valide, on évite l'appel ffprobe ; sinon on sonde et on
+    mémorise. La conversion elle-même re-sonde toujours le fichier en entier.
+    """
+    try:
+        st = f.stat()
+    except OSError:
+        info = get_video_info(f)
+        return info["codec"], info["width"], info["height"]
+
+    key = str(f)
+    ent = cache.get(key)
+    if ent and ent.get("mtime") == int(st.st_mtime) and ent.get("size") == st.st_size:
+        return ent.get("codec"), ent.get("width"), ent.get("height")
+
+    info = get_video_info(f)
+    cache[key] = {
+        "mtime": int(st.st_mtime),
+        "size": st.st_size,
+        "codec": info["codec"],
+        "width": info["width"],
+        "height": info["height"],
+    }
+    return info["codec"], info["width"], info["height"]
+
+
+def prewarm_scan(candidates: list, cache: dict) -> None:
+    """Pré-sonde en parallèle (ffprobe) les fichiers absents/périmés du cache.
+
+    ffprobe est I/O-bound : les threads se recouvrent bien. Les écritures du
+    cache se font ici, dans le thread principal (ex.map yield séquentiel) — pas
+    d'accès concurrent au dict. La décision de scan reste ensuite séquentielle
+    (ordre des logs stable), avec des hits de cache garantis.
+    """
+    if SCAN_WORKERS <= 1 or not candidates:
+        return
+    misses = []
+    for f in candidates:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        ent = cache.get(str(f))
+        if not (
+            ent
+            and ent.get("mtime") == int(st.st_mtime)
+            and ent.get("size") == st.st_size
+        ):
+            misses.append((f, st))
+    if not misses:
+        return
+
+    def work(item):
+        f, st = item
+        return str(f), st, get_video_info(f)
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        for key, st, info in ex.map(work, misses):
+            cache[key] = {
+                "mtime": int(st.st_mtime),
+                "size": st.st_size,
+                "codec": info["codec"],
+                "width": info["width"],
+                "height": info["height"],
+            }
+
+
+def enough_space(target_dir: Path, needed: int) -> bool:
+    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
+
+    Indéterminé (erreur OS) -> True : on ne bloque pas une conversion par excès
+    de prudence si l'espace libre n'a pas pu être lu.
+    """
+    try:
+        return shutil.disk_usage(target_dir).free >= needed
+    except OSError:
+        return True
+
+
 def convert_to_x265(input_path: Path) -> bool:
     """Convert a file to x265 using NVENC, preserving all streams."""
     output_path = input_path.with_name(input_path.stem + "_x265.mkv")
@@ -179,6 +333,14 @@ def convert_to_x265(input_path: Path) -> bool:
     if DRY_RUN:
         log(f"  [DRY-RUN] Would convert to: {output_path.name}")
         return True
+
+    # Disk-space guard: the new output coexists with the original until it is
+    # replaced, so require at least the source size (HEVC is usually smaller)
+    # plus a margin. Skip the file cleanly rather than fill the volume mid-batch.
+    needed = input_path.stat().st_size + 200 * 1024 * 1024
+    if not enough_space(output_path.parent, needed):
+        log(f"  [✗] Not enough free disk space to convert {input_path.name} — skipped")
+        return False
 
     # Build an explicit stream map instead of "-map 0". Real-world files carry
     # streams that break the conversion: subtitle streams ffmpeg can't identify
@@ -277,14 +439,13 @@ def convert_to_x265(input_path: Path) -> bool:
         audio_ok = out_info["audio_tracks"] == info["audio_tracks"]
         sub_ok = out_info["subtitle_tracks"] == expected_subs
 
-        old_mb = input_path.stat().st_size / 1024 / 1024
-        new_mb = output_path.stat().st_size / 1024 / 1024
+        old_bytes = input_path.stat().st_size
+        new_bytes = output_path.stat().st_size
+        old_mb = old_bytes / 1024 / 1024
+        new_mb = new_bytes / 1024 / 1024
         saving = 100 - (new_mb / old_mb * 100)
 
-        log(
-            f"  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB "
-            f"(saved {saving:.1f}%)"
-        )
+        log(f"  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB " f"(saved {saving:.1f}%)")
 
         if not audio_ok:
             log(
@@ -303,6 +464,18 @@ def convert_to_x265(input_path: Path) -> bool:
             )
             return False
 
+        # Verify output DURATION matches the source: a correct stream count does
+        # not guarantee a complete encode (a truncated output keeps all streams
+        # but loses time). Refuse to delete the original when durations diverge.
+        in_dur = get_duration(input_path)
+        out_dur = get_duration(output_path)
+        if in_dur and out_dur and abs(in_dur - out_dur) > max(1.0, 0.01 * in_dur):
+            log(
+                f"  [✗] Duration mismatch ({in_dur:.0f}s → {out_dur:.0f}s) — "
+                f"likely truncated, original kept: {output_path.name}"
+            )
+            return False
+
         # Success: replace the original with the converted file, keeping its name
         final_path = input_path.with_name(input_path.stem + ".mkv")
         if final_path.exists() and final_path != input_path:
@@ -315,6 +488,11 @@ def convert_to_x265(input_path: Path) -> bool:
         input_path.unlink()
         output_path.rename(final_path)
         log(f"  [✓] Replaced original → {final_path.name}")
+
+        # Cumul pour le bilan « espace économisé » (uniquement les conversions
+        # menées à terme et validées).
+        STATS["old_bytes"] += old_bytes
+        STATS["new_bytes"] += new_bytes
 
         return True
 
@@ -330,7 +508,7 @@ def convert_to_x265(input_path: Path) -> bool:
         return False
 
 
-def scan_and_convert(root: str) -> tuple[int, int]:
+def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
     root_path = Path(root)
 
     if not root_path.exists():
@@ -346,21 +524,19 @@ def scan_and_convert(root: str) -> tuple[int, int]:
 
     log(f"[*] Found {len(candidates)} video files to check\n")
 
+    # Pré-sonde en parallèle (cache-miss) avant la décision séquentielle.
+    prewarm_scan(candidates, cache)
+
     to_convert = []
     for f in candidates:
-        info = get_video_info(f)
-        codec = info["codec"]
-        too_big = needs_downscale(info["width"], info["height"])
+        codec, width, height = probe_for_scan(f, cache)
+        too_big = needs_downscale(width, height)
         if codec is None:
             log(f"  [?] Could not detect codec: {f.name}")
         elif codec in ("hevc", "h265") and not too_big:
             log(f"  [=] Already x265, skipping: {f.relative_to(root_path)}")
         else:
-            reason = (
-                f"downscale {info['width']}x{info['height']}"
-                if too_big
-                else f"not x265 ({codec})"
-            )
+            reason = f"downscale {width}x{height}" if too_big else f"not x265 ({codec})"
             log(f"  [!] To convert ({reason}): {f.relative_to(root_path)}")
             to_convert.append(f)
 
@@ -388,18 +564,39 @@ def scan_and_convert(root: str) -> tuple[int, int]:
     return success, failed
 
 
+def _human_bytes(size: float) -> str:
+    for unit in ("o", "Ko", "Mo", "Go"):
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} To"
+
+
 if __name__ == "__main__":
+    # Fichier log persistant (à côté des scripts, gitignoré), en plus de stdout.
+    log_name = "dry_run.log" if DRY_RUN else "conversion.log"
+    try:
+        LOG_FILE_HANDLE = open(
+            Path(__file__).with_name(log_name), "a", encoding="utf-8"
+        )
+    except OSError:
+        LOG_FILE_HANDLE = None
+
     if DRY_RUN:
         log("[*] DRY-RUN mode: simulation only, no file will be converted\n")
+
+    scan_cache = load_scan_cache(SCAN_CACHE_PATH)
 
     total_success, total_failed = 0, 0
     for folder in INPUT_FOLDERS:
         log("\n" + "═" * 60)
         log(f"[*] Folder: {folder}")
         log("═" * 60 + "\n")
-        s, f = scan_and_convert(folder)
+        s, f = scan_and_convert(folder, scan_cache)
         total_success += s
         total_failed += f
+
+    save_scan_cache(SCAN_CACHE_PATH, scan_cache)
 
     if len(INPUT_FOLDERS) > 1:
         log("\n" + "═" * 60)
@@ -407,3 +604,15 @@ if __name__ == "__main__":
         log(f"[✓] Converted successfully : {total_success}")
         log(f"[✗] Failed                 : {total_failed}")
         log("═" * 60)
+
+    # Bilan « espace économisé » sur les conversions menées à terme.
+    if STATS["old_bytes"] > 0:
+        saved = STATS["old_bytes"] - STATS["new_bytes"]
+        pct = 100 * saved / STATS["old_bytes"]
+        log(
+            f"[*] Space: {_human_bytes(STATS['old_bytes'])} → "
+            f"{_human_bytes(STATS['new_bytes'])}  (saved {_human_bytes(saved)}, {pct:.1f}%)"
+        )
+
+    if LOG_FILE_HANDLE is not None:
+        LOG_FILE_HANDLE.close()

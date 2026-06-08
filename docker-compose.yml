@@ -25,6 +25,11 @@ services:
       # la config prend effet sans rebuild.
       - ./src/public-media:/work
     working_dir: /work
+    environment:
+      # Surcharge éventuelle du DRY_RUN par le lanceur (--dry-run/--real). Si la
+      # variable n'est pas définie côté hôte, les scripts retombent sur la valeur
+      # de 00-config.py. Forme « clé sans valeur » = transmission de l'env hôte.
+      - PIPELINE_DRY_RUN
     # On nettoie d'abord les noms (renommage), puis on convertit en HEVC.
     # Les deux scripts partagent INPUT_FOLDERS / DRY_RUN (via 00-config.py).
     command: ["sh", "-c", "python3 01-clean-names.py && python3 02-convert-to-h265.py"]

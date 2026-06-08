@@ -40,6 +40,12 @@ INPUT_FOLDERS = [
 #           conversion réussie.
 DRY_RUN = False
 
+# Notification de fin de pipeline (les runs durent souvent des heures). URL d'un
+# webhook recevant le message de bilan en POST (texte brut) — ex. ntfy.sh :
+# "https://ntfy.sh/mon-canal-prive". None = aucune notification (défaut).
+# Le lanceur appelle src/public-media/notify.py en fin de run (succès ET échec).
+NOTIFY_WEBHOOK = None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 01 — clean-names
 #   Renomme dossiers/fichiers : retire les jetons techniques (codecs, résolutions,
@@ -66,10 +72,21 @@ CLEAN_TECH_WORDS = set(
 #   en sortie avant de remplacer l'original.
 # ══════════════════════════════════════════════════════════════════════════════
 
-CONVERT_CQ = 26          # qualité NVENC : + bas = mieux (24–28 conseillé)
-CONVERT_PRESET = "p4"    # préréglage NVENC : p1 (rapide) → p7 (qualité)
+CONVERT_CQ = 26  # qualité NVENC : + bas = mieux (24–28 conseillé)
+CONVERT_PRESET = "p4"  # préréglage NVENC : p1 (rapide) → p7 (qualité)
 CONVERT_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov"}  # conteneurs scannés
 CONVERT_SKIP_SUFFIX = "_x265"  # fichiers déjà convertis (ignorés au scan)
+
+# Cache de scan : mémorise (codec, dimensions) par fichier, validé par (mtime,
+# taille), pour éviter de re-sonder via ffprobe TOUTE la bibliothèque à chaque
+# run (gain majeur sur les runs répétés). Fichier JSON à côté des scripts
+# (gitignoré) ; mettre None pour désactiver le cache.
+CONVERT_SCAN_CACHE = ".scan-cache.json"
+
+# Nombre de sondes ffprobe parallèles pendant la phase de SCAN (I/O-bound : les
+# threads se recouvrent bien). N'affecte pas l'encodage (séquentiel sur le GPU).
+# 1 = scan séquentiel (comportement d'origine).
+CONVERT_SCAN_WORKERS = 8
 
 # Downscale optionnel : résolution MAX de sortie. Tout fichier dépassant cette
 # résolution est ré-encodé (MÊME s'il est déjà HEVC) en le réduisant pour tenir

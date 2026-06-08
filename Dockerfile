@@ -28,11 +28,12 @@ RUN apt-get update \
 RUN curl -fsSL https://rclone.org/install.sh | bash
 
 # Dépendances Python du pipeline perso :
-#   - Pillow : redimensionnement / ré-encodage des photos (03)
-#   - piexif : lecture/écriture des dates EXIF des photos (02)
+#   - Pillow      : redimensionnement / ré-encodage des photos (03)
+#   - piexif      : lecture/écriture des dates EXIF des photos (02)
+#   - pillow-heif : décodage HEIC/HEIF (photos iPhone récentes) -> JPG (01)
 # --break-system-packages : Ubuntu 24.04 applique PEP668 (env « externally
 # managed ») et refuse sinon l'install système ; OK ici, c'est un conteneur.
-RUN pip install --no-cache-dir --break-system-packages Pillow piexif
+RUN pip install --no-cache-dir --break-system-packages Pillow piexif pillow-heif
 
 # Fuseau horaire : aligne les timestamps des logs sur l'heure de Paris.
 ENV TZ=Europe/Paris

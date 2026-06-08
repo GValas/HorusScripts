@@ -13,13 +13,15 @@ Côté vidéo, seul le conteneur MKV est traité : le pipeline amont
 
 Stratégie de date de remplacement (par ordre de priorité) :
   1. Un autre tag de date présent dans le même fichier
-  2. Une date encodée dans le NOM de fichier (YYYYMMDD_HHMMSS, p.ex. issue
+  2. Un sidecar JSON Google Takeout voisin (photoTakenTime) — horodatage fiable
+     exporté par Google Photos
+  3. Une date encodée dans le NOM de fichier (YYYYMMDD_HHMMSS, p.ex. issue
      d'un appareil photo / téléphone) — horodatage de prise de vue explicite
-  3. La date d'une photo du même dossier qui possède déjà un tag valide
-  4. Le préfixe « YY.MM » du dossier parent (ex. « 12.02 - Olivia... » ->
+  4. La date d'une photo du même dossier qui possède déjà un tag valide
+  5. Le préfixe « YY.MM » du dossier parent (ex. « 12.02 - Olivia... » ->
      2012-02-01) — libellé humain, daté au 1er du mois
-  5. Dernier recours : la date de modification du fichier (mtime)
-  6. Abandon (fichier signalé comme non corrigeable)
+  6. Dernier recours : la date de modification du fichier (mtime)
+  7. Abandon (fichier signalé comme non corrigeable)
 
 C'est ici qu'est concentrée toute l'inférence de date : le pipeline amont
 (01-convert-to-mkv+h265.py) ne fait que CONSERVER les tags existants lors de
@@ -57,14 +59,18 @@ import piexif
 # ══════════════════════════════════════════════════════════════════════════════
 
 _spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py"))
+    "pipeline_config", Path(__file__).with_name("00-config.py")
+)
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-SOURCE       = config.PHOTOS_SRC
-EXPORT_CSV   = config.ENRICH_EXPORT_CSV
-EXPORT_JSON  = config.ENRICH_EXPORT_JSON
-DRY_RUN      = config.DRY_RUN
+SOURCE = config.PHOTOS_SRC
+EXPORT_CSV = config.ENRICH_EXPORT_CSV
+EXPORT_JSON = config.ENRICH_EXPORT_JSON
+DRY_RUN = config.DRY_RUN
+_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
+if _dr is not None:
+    DRY_RUN = _dr == "1"
 
 PHOTO_EXTENSIONS = config.PHOTO_EXT
 VIDEO_EXTENSIONS = config.VIDEO_EXT
@@ -107,6 +113,7 @@ def setup_logging() -> logging.Logger:
 # UTILITAIRES DE DATE
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _is_plausible_date(dt: datetime) -> bool:
     """Écarte les dates epoch (1904/1970) et les valeurs aberrantes."""
     return MIN_PLAUSIBLE_YEAR <= dt.year <= MAX_PLAUSIBLE_YEAR
@@ -133,8 +140,13 @@ def _parse_any_date(value) -> datetime | None:
         core = core[:-6].strip()
 
     for candidate in (core, core[:19]):
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y:%m:%d %H:%M:%S",
-                    "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y:%m:%d"):
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y:%m:%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y:%m:%d",
+        ):
             try:
                 return datetime.strptime(candidate, fmt)
             except ValueError:
@@ -146,6 +158,7 @@ def _parse_any_date(value) -> datetime | None:
 # LECTURE DES TAGS — PHOTOS
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def check_photo_tags(filepath: Path) -> dict:
     result = {
         "type": "photo",
@@ -153,14 +166,14 @@ def check_photo_tags(filepath: Path) -> dict:
         "tags_missing": [],
         "has_critical_tag": False,
         "primary_date": None,
-        "pic_dict": None,   # conservé pour la correction
+        "pic_dict": None,  # conservé pour la correction
         "error": None,
     }
 
     TAG_DEFS = [
-        ("0th",  piexif.ImageIFD.DateTime,          "Image DateTime",         False),
-        ("Exif", piexif.ExifIFD.DateTimeOriginal,   "EXIF DateTimeOriginal",  True),
-        ("Exif", piexif.ExifIFD.DateTimeDigitized,  "EXIF DateTimeDigitized", False),
+        ("0th", piexif.ImageIFD.DateTime, "Image DateTime", False),
+        ("Exif", piexif.ExifIFD.DateTimeOriginal, "EXIF DateTimeOriginal", True),
+        ("Exif", piexif.ExifIFD.DateTimeDigitized, "EXIF DateTimeDigitized", False),
     ]
 
     try:
@@ -171,8 +184,14 @@ def check_photo_tags(filepath: Path) -> dict:
             ifd_dict = pic_dict.get(ifd, {})
             val = ifd_dict.get(tag_id)
             if val and val != NULL_DATE:
-                date_str = val.decode("utf-8", errors="replace") if isinstance(val, bytes) else str(val)
-                result["tags_found"].append({"tag": tag_name, "value": date_str, "raw": val})
+                date_str = (
+                    val.decode("utf-8", errors="replace")
+                    if isinstance(val, bytes)
+                    else str(val)
+                )
+                result["tags_found"].append(
+                    {"tag": tag_name, "value": date_str, "raw": val}
+                )
                 if result["primary_date"] is None:
                     result["primary_date"] = date_str
                 if is_critical:
@@ -192,6 +211,7 @@ def check_photo_tags(filepath: Path) -> dict:
 # LECTURE DES TAGS — VIDÉOS (ffprobe)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _ffprobe_date(filepath: Path) -> datetime | None:
     """
     Lit la première date de création plausible exposée par ffprobe
@@ -200,10 +220,18 @@ def _ffprobe_date(filepath: Path) -> datetime | None:
     """
     proc = subprocess.run(
         [
-            "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_format", "-show_streams", str(filepath),
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(filepath),
         ],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     if proc.returncode != 0 or not proc.stdout:
         return None
@@ -266,6 +294,7 @@ def check_video_tags(filepath: Path) -> dict:
 # RECHERCHE DE DATE DE REMPLACEMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _best_date_from_tags(info: dict) -> bytes | None:
     """Retourne la meilleure date trouvée dans les tags existants du fichier."""
     for tag in info.get("tags_found", []):
@@ -311,6 +340,47 @@ def _date_from_filename(filepath: Path) -> bytes | None:
             dt = datetime(year, month, day, hour, minute, second)
         except ValueError:
             continue
+        if not _is_plausible_date(dt):
+            continue
+        return dt.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
+    return None
+
+
+def _date_from_takeout_json(filepath: Path) -> bytes | None:
+    """
+    Date depuis un sidecar JSON Google Takeout voisin (photoTakenTime.timestamp).
+
+    Google Photos exporte, à côté de chaque média, un fichier JSON
+    (« IMG_1234.jpg.json », « ....supplemental-metadata.json », ou une variante
+    au nom tronqué) contenant l'horodatage de prise de vue en epoch UTC. C'est
+    une source bien plus fiable que la mtime ou le dossier : on la place juste
+    après les tags du fichier. Le timestamp UTC est converti en heure de Paris
+    (cohérent avec l'affichage attendu). Retourne une date EXIF, ou None.
+    """
+    candidates = [
+        filepath.with_name(filepath.name + ".json"),
+        filepath.with_name(filepath.name + ".supplemental-metadata.json"),
+    ]
+    # Variante au nom tronqué par Google (noms longs coupés) : glob léger.
+    candidates += sorted(filepath.parent.glob(filepath.name + ".*.json"))
+
+    for sidecar in candidates:
+        if not sidecar.is_file():
+            continue
+        try:
+            with open(sidecar, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        block = data.get("photoTakenTime") or data.get("creationTime") or {}
+        ts = block.get("timestamp") if isinstance(block, dict) else None
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromtimestamp(int(ts), tz=ZoneInfo("Europe/Paris"))
+        except (ValueError, OverflowError, OSError):
+            continue
+        dt = dt.replace(tzinfo=None)  # EXIF = heure locale sans fuseau
         if not _is_plausible_date(dt):
             continue
         return dt.strftime("%Y:%m:%d %H:%M:%S").encode("ascii")
@@ -402,22 +472,27 @@ def resolve_date(filepath: Path, info: dict) -> tuple[bytes | None, str]:
     if date:
         return date, "tag existant dans le fichier"
 
-    # Priorité 2 : date encodée dans le nom de fichier (horodatage explicite)
+    # Priorité 2 : sidecar JSON Google Takeout (horodatage fiable)
+    date = _date_from_takeout_json(filepath)
+    if date:
+        return date, "sidecar Google Takeout (.json)"
+
+    # Priorité 3 : date encodée dans le nom de fichier (horodatage explicite)
     date = _date_from_filename(filepath)
     if date:
         return date, "nom de fichier (YYYYMMDD_HHMMSS)"
 
-    # Priorité 3 : date d'une photo voisine dans le même dossier
+    # Priorité 4 : date d'une photo voisine dans le même dossier
     date = _date_from_folder(filepath)
     if date:
         return date, f"photo voisine dans {filepath.parent.name}/"
 
-    # Priorité 4 : préfixe « YY.MM » du dossier parent (1er du mois)
+    # Priorité 5 : préfixe « YY.MM » du dossier parent (1er du mois)
     date = _date_from_parent_folder(filepath)
     if date:
         return date, f"dossier « {filepath.parent.name} » (YY.MM)"
 
-    # Priorité 5 : dernier recours, date de modification (mtime)
+    # Priorité 6 : dernier recours, date de modification (mtime)
     date = _date_from_mtime(filepath)
     if date:
         return date, "date de modification (mtime)"
@@ -429,23 +504,33 @@ def resolve_date(filepath: Path, info: dict) -> tuple[bytes | None, str]:
 # CORRECTION DES FICHIERS — PHOTOS
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def fix_photo(filepath: Path, info: dict, date: bytes, dry_run: bool) -> str:
     """Injecte les tags de date manquants dans une photo JPEG."""
     pic_dict = info.get("pic_dict")
     if pic_dict is None:
         return "erreur: EXIF non chargé"
 
-    oth_dict  = pic_dict.setdefault("0th", {})
+    oth_dict = pic_dict.setdefault("0th", {})
     exif_dict = pic_dict.setdefault("Exif", {})
 
     changed = False
-    if not oth_dict.get(piexif.ImageIFD.DateTime) or oth_dict.get(piexif.ImageIFD.DateTime) == NULL_DATE:
+    if (
+        not oth_dict.get(piexif.ImageIFD.DateTime)
+        or oth_dict.get(piexif.ImageIFD.DateTime) == NULL_DATE
+    ):
         oth_dict[piexif.ImageIFD.DateTime] = date
         changed = True
-    if not exif_dict.get(piexif.ExifIFD.DateTimeOriginal) or exif_dict.get(piexif.ExifIFD.DateTimeOriginal) == NULL_DATE:
+    if (
+        not exif_dict.get(piexif.ExifIFD.DateTimeOriginal)
+        or exif_dict.get(piexif.ExifIFD.DateTimeOriginal) == NULL_DATE
+    ):
         exif_dict[piexif.ExifIFD.DateTimeOriginal] = date
         changed = True
-    if not exif_dict.get(piexif.ExifIFD.DateTimeDigitized) or exif_dict.get(piexif.ExifIFD.DateTimeDigitized) == NULL_DATE:
+    if (
+        not exif_dict.get(piexif.ExifIFD.DateTimeDigitized)
+        or exif_dict.get(piexif.ExifIFD.DateTimeDigitized) == NULL_DATE
+    ):
         exif_dict[piexif.ExifIFD.DateTimeDigitized] = date
         changed = True
 
@@ -468,6 +553,7 @@ def fix_photo(filepath: Path, info: dict, date: bytes, dry_run: bool) -> str:
 # CORRECTION DES FICHIERS — VIDÉOS (ffmpeg, remux sans réencodage)
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def _ffmpeg_set_creation_time(filepath: Path, dt: datetime) -> None:
     """
     Réécrit la vidéo en remux (`-c copy`, sans réencodage) en injectant
@@ -479,11 +565,20 @@ def _ffmpeg_set_creation_time(filepath: Path, dt: datetime) -> None:
     tmp = filepath.with_name(f"{filepath.stem}.datetmp{filepath.suffix}")
 
     cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(filepath),
-        "-map", "0", "-c", "copy",
-        "-map_metadata", "0",
-        "-metadata", f"creation_time={iso}",
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(filepath),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-map_metadata",
+        "0",
+        "-metadata",
+        f"creation_time={iso}",
         str(tmp),
     ]
 
@@ -515,7 +610,9 @@ def fix_video(filepath: Path, date: bytes, dry_run: bool) -> str:
         return "erreur: date source illisible"
 
     if dry_run:
-        return f"DRY RUN — serait mis à jour (ffmpeg creation_time={dt:%Y-%m-%d %H:%M:%S})"
+        return (
+            f"DRY RUN — serait mis à jour (ffmpeg creation_time={dt:%Y-%m-%d %H:%M:%S})"
+        )
 
     try:
         _ffmpeg_set_creation_time(filepath, dt)
@@ -530,21 +627,23 @@ def fix_video(filepath: Path, date: bytes, dry_run: bool) -> str:
 # SCAN PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool) -> list[dict]:
     results = []
     all_files = sorted(root.rglob("*"))
     media_files = [
-        f for f in all_files
+        f
+        for f in all_files
         if f.is_file() and f.suffix.lower() in (PHOTO_EXTENSIONS, VIDEO_EXTENSIONS)
     ]
 
     total = len(media_files)
-    mode  = "🧪 DRY RUN" if dry_run else "✏️  ÉCRITURE"
+    mode = "🧪 DRY RUN" if dry_run else "✏️  ÉCRITURE"
     logger.info("%s — %d fichier(s) média dans « %s »", mode, total, root)
 
     for i, filepath in enumerate(media_files, 1):
         is_video = filepath.suffix.lower() == VIDEO_EXTENSIONS
-        info     = check_video_tags(filepath) if is_video else check_photo_tags(filepath)
+        info = check_video_tags(filepath) if is_video else check_photo_tags(filepath)
 
         fix_result = None
         date_source = None
@@ -565,15 +664,15 @@ def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool) -> list[dict
             logger.warning("       action      : %s", fix_result)
 
         record = {
-            "fichier":              str(filepath),
-            "type":                 info["type"],
+            "fichier": str(filepath),
+            "type": info["type"],
             "tag_critique_present": info["has_critical_tag"],
-            "date_principale":      info.get("primary_date") or "",
-            "tags_presents":        "; ".join(t["tag"] for t in info.get("tags_found", [])),
-            "tags_manquants":       "; ".join(t["tag"] for t in info.get("tags_missing", [])),
-            "date_source":          date_source or "",
-            "action":               fix_result or "",
-            "erreur":               info.get("error") or "",
+            "date_principale": info.get("primary_date") or "",
+            "tags_presents": "; ".join(t["tag"] for t in info.get("tags_found", [])),
+            "tags_manquants": "; ".join(t["tag"] for t in info.get("tags_missing", [])),
+            "date_source": date_source or "",
+            "action": fix_result or "",
+            "erreur": info.get("error") or "",
         }
         results.append(record)
 
@@ -584,13 +683,18 @@ def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool) -> list[dict
 # RAPPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def print_summary(results: list[dict], logger: logging.Logger, dry_run: bool) -> None:
-    ok       = sum(1 for r in results if r["tag_critique_present"])
-    ko       = sum(1 for r in results if not r["tag_critique_present"])
-    fixed    = sum(1 for r in results if "corrigé" in r["action"] or "DRY RUN" in r["action"])
-    unfixable= sum(1 for r in results if "introuvable" in r["action"] or "⛔" in r["action"])
-    errors   = sum(1 for r in results if r["erreur"] or "erreur" in r["action"])
-    total    = len(results)
+    ok = sum(1 for r in results if r["tag_critique_present"])
+    ko = sum(1 for r in results if not r["tag_critique_present"])
+    fixed = sum(
+        1 for r in results if "corrigé" in r["action"] or "DRY RUN" in r["action"]
+    )
+    unfixable = sum(
+        1 for r in results if "introuvable" in r["action"] or "⛔" in r["action"]
+    )
+    errors = sum(1 for r in results if r["erreur"] or "erreur" in r["action"])
+    total = len(results)
 
     logger.info("=" * 60)
     logger.info("RÉSUMÉ %s", "(DRY RUN)" if dry_run else "")
@@ -604,13 +708,22 @@ def print_summary(results: list[dict], logger: logging.Logger, dry_run: bool) ->
     logger.info("=" * 60)
 
     if dry_run and fixed > 0:
-        logger.info("💡  C'est un DRY RUN. Passez DRY_RUN=false (env) pour appliquer les corrections.")
+        logger.info(
+            "💡  C'est un DRY RUN. Passez DRY_RUN=false (env) pour appliquer les corrections."
+        )
 
 
 def save_csv(results: list[dict], output_path: str, logger: logging.Logger) -> None:
     fieldnames = [
-        "fichier", "type", "tag_critique_present", "date_principale",
-        "tags_presents", "tags_manquants", "date_source", "action", "erreur",
+        "fichier",
+        "type",
+        "tag_critique_present",
+        "date_principale",
+        "tags_presents",
+        "tags_manquants",
+        "date_source",
+        "action",
+        "erreur",
     ]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -622,6 +735,7 @@ def save_csv(results: list[dict], output_path: str, logger: logging.Logger) -> N
 # ══════════════════════════════════════════════════════════════════════════════
 # POINT D'ENTRÉE
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None

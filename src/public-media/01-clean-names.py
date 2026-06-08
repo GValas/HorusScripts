@@ -14,13 +14,21 @@ from pathlib import Path
 ##################################################################
 
 _spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py"))
+    "pipeline_config", Path(__file__).with_name("00-config.py")
+)
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-ROOTS = config.INPUT_FOLDERS          # dossiers parcourus récursivement
-DRY_RUN = config.DRY_RUN              # True = simulation, False = renommage réel
+ROOTS = config.INPUT_FOLDERS  # dossiers parcourus récursivement
+DRY_RUN = config.DRY_RUN  # True = simulation, False = renommage réel
 TECH_WORDS = config.CLEAN_TECH_WORDS  # mots techniques retirés des noms
+
+# Surcharge CLI : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
+# --real), prime sur 00-config.py — pratique pour un run ponctuel sans éditer
+# (ni risquer d'oublier de remettre) la config.
+_dr = os.environ.get("PIPELINE_DRY_RUN")
+if _dr is not None:
+    DRY_RUN = _dr == "1"
 
 ##################################################################
 
@@ -178,7 +186,12 @@ if __name__ == "__main__":
 
     # ── Dossiers ────────────────────────────────────────────
     logger.info("\n── Dossiers ──")
-    olds = sorted(get_movies_dirs(ROOTS))
+    # Renommage du PLUS PROFOND au moins profond : clean_movies_dir ne touche que
+    # le basename, donc renommer un enfant avant son parent garde des chemins
+    # valides (le parent existe encore). À l'inverse, renommer le parent d'abord
+    # rendrait périmé le chemin stocké de l'enfant -> os.rename échouerait
+    # (« old n'existe plus »). Cas typique : tvshows/Série/Season 01/.
+    olds = sorted(get_movies_dirs(ROOTS), key=lambda p: p.count(os.sep), reverse=True)
     news = clean_movies_dirs(olds)
     col = detect_collisions(olds, news, logger)
     r, sk, e = apply_renames(olds, news, logger, DRY_RUN)

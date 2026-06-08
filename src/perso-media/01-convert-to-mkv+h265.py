@@ -23,10 +23,13 @@ Prérequis : ffmpeg + ffprobe installés et accessibles dans le PATH
 """
 
 import os
+import json
+import shutil
 import subprocess
 import sys
 import logging
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
@@ -34,20 +37,34 @@ from zoneinfo import ZoneInfo
 
 # ── Configuration : tout est dans 00-config.py (CONVERT_*) ──────────────────
 _spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py"))
+    "pipeline_config", Path(__file__).with_name("00-config.py")
+)
 config = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(config)
 
-SOURCE_DIR    = Path(config.PHOTOS_SRC)
-DRY_RUN       = config.DRY_RUN
-RENAME_JPEG   = config.CONVERT_RENAME_JPEG
-EXTENSIONS    = config.CONVERT_EXTENSIONS
+SOURCE_DIR = Path(config.PHOTOS_SRC)
+DRY_RUN = config.DRY_RUN
+_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
+if _dr is not None:
+    DRY_RUN = _dr == "1"
+RENAME_JPEG = config.CONVERT_RENAME_JPEG
+HEIC_TO_JPG = config.CONVERT_HEIC_TO_JPG
+HEIC_EXTENSIONS = config.CONVERT_HEIC_EXTENSIONS
+JPEG_QUALITY = config.CONVERT_JPEG_QUALITY
+EXTENSIONS = config.CONVERT_EXTENSIONS
 OUTPUT_SUFFIX = config.CONVERT_OUTPUT_SUFFIX
 MIN_PLAUSIBLE_YEAR = config.MIN_PLAUSIBLE_YEAR
-CQ            = config.VIDEO_CQ
-NVENC_PRESET  = config.VIDEO_PRESET
-AUDIO_CODEC   = config.CONVERT_AUDIO_CODEC
+CQ = config.VIDEO_CQ
+NVENC_PRESET = config.VIDEO_PRESET
+AUDIO_CODEC = config.CONVERT_AUDIO_CODEC
 AUDIO_BITRATE = config.CONVERT_AUDIO_BITRATE
+# Cache de scan (codec par fichier) ; None = désactivé.
+SCAN_CACHE_PATH = (
+    Path(__file__).with_name(config.CONVERT_SCAN_CACHE)
+    if getattr(config, "CONVERT_SCAN_CACHE", None)
+    else None
+)
+SCAN_WORKERS = getattr(config, "CONVERT_SCAN_WORKERS", 1)  # sondes // au scan
 # ───────────────────────────────────────────────────────────
 
 
@@ -98,7 +115,8 @@ def nvenc_available() -> bool:
     try:
         out = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
     except (FileNotFoundError, OSError):
         return False
@@ -107,22 +125,133 @@ def nvenc_available() -> bool:
 
 def get_video_codec(path: Path) -> str | None:
     cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(path)
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     return result.stdout.strip() or None
 
 
+def load_scan_cache(path: Path | None) -> dict:
+    """Charge le cache de scan JSON (clé = chemin) ; {} si absent/désactivé."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_scan_cache(path: Path | None, cache: dict) -> None:
+    """Écrit le cache de scan (best-effort : une erreur d'écriture est ignorée)."""
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except OSError:
+        pass
+
+
+def get_video_codec_cached(path: Path, cache: dict) -> str | None:
+    """Codec vidéo avec cache validé par (mtime, taille) : évite un ffprobe par
+    fichier déjà connu et inchangé. Sur miss/changement, sonde et mémorise."""
+    try:
+        st = path.stat()
+    except OSError:
+        return get_video_codec(path)
+    key = str(path)
+    ent = cache.get(key)
+    if ent and ent.get("mtime") == int(st.st_mtime) and ent.get("size") == st.st_size:
+        return ent.get("codec")
+    codec = get_video_codec(path)
+    cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "codec": codec}
+    return codec
+
+
+def prewarm_codecs(candidates: list, cache: dict) -> None:
+    """Pré-sonde en parallèle (ffprobe) le codec des fichiers absents du cache.
+
+    ffprobe est I/O-bound : les threads se recouvrent. Les écritures du cache se
+    font dans le thread principal (ex.map yield séquentiel). L'encodage qui suit
+    reste séquentiel (GPU partagé)."""
+    if SCAN_WORKERS <= 1 or not candidates:
+        return
+    misses = []
+    for f in candidates:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        ent = cache.get(str(f))
+        if not (
+            ent
+            and ent.get("mtime") == int(st.st_mtime)
+            and ent.get("size") == st.st_size
+        ):
+            misses.append((f, st))
+    if not misses:
+        return
+
+    def work(item):
+        f, st = item
+        return str(f), st, get_video_codec(f)
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        for key, st, codec in ex.map(work, misses):
+            cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "codec": codec}
+
+
+def enough_space(target_dir: Path, needed: int) -> bool:
+    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
+
+    Indéterminé (erreur OS) -> True : on ne bloque pas une conversion par excès
+    de prudence si l'espace libre n'a pas pu être lu.
+    """
+    try:
+        return shutil.disk_usage(target_dir).free >= needed
+    except OSError:
+        return True
+
+
+def get_duration(path: Path) -> float | None:
+    """Durée du fichier en secondes (ffprobe format.duration) ; None si indéterminée."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        return float(result.stdout.strip())
+    except (ValueError, subprocess.SubprocessError, OSError):
+        return None
+
+
 def get_creation_time(path: Path) -> str | None:
     """Lit le tag creation_time exposé par ffprobe (tags de format) ; None si absent."""
     cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format_tags=creation_time",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format_tags=creation_time",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -134,7 +263,7 @@ def _parse_iso(value: str) -> datetime | None:
     core = value.strip().replace("T", " ").split(".")[0].strip()
     if core.endswith("Z"):
         core = core[:-1].strip()
-    if len(core) >= 6 and core[-6] in "+-" and core[-3] == ":":   # suffixe ±hh:mm
+    if len(core) >= 6 and core[-6] in "+-" and core[-3] == ":":  # suffixe ±hh:mm
         core = core[:-6].strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -162,8 +291,12 @@ def existing_creation_iso(path: Path) -> str | None:
     return None
 
 
-def encode_h265(input_path: Path, output_path: Path,
-                creation_iso: str | None, logger: logging.Logger) -> bool:
+def encode_h265(
+    input_path: Path,
+    output_path: Path,
+    creation_iso: str | None,
+    logger: logging.Logger,
+) -> bool:
     """Ré-encode la vidéo en H.265 sur GPU NVIDIA (NVENC) — tout codec non-H.265.
 
     Encodage GPU UNIQUEMENT : aucun repli CPU (libx265). Si NVENC est
@@ -172,19 +305,32 @@ def encode_h265(input_path: Path, output_path: Path,
     """
     cmd = [
         "ffmpeg",
-        "-i",      str(input_path),
-        "-map_metadata", "0",        # recopie les métadonnées globales (dont creation_time)
-        "-c:v",    "hevc_nvenc",     # encodage GPU NVIDIA (NVENC) — pas de CPU
-        "-rc",     "vbr",
-        "-cq",     str(CQ),
-        "-qmin",   str(CQ),
-        "-qmax",   str(CQ),
-        "-b:v",    "0",
-        "-preset", NVENC_PRESET,
-        "-tag:v",  "hvc1",           # compatibilité Apple
-        "-pix_fmt", "yuv420p",
-        "-c:a",    AUDIO_CODEC,
-        "-b:a",    AUDIO_BITRATE,
+        "-i",
+        str(input_path),
+        "-map_metadata",
+        "0",  # recopie les métadonnées globales (dont creation_time)
+        "-c:v",
+        "hevc_nvenc",  # encodage GPU NVIDIA (NVENC) — pas de CPU
+        "-rc",
+        "vbr",
+        "-cq",
+        str(CQ),
+        "-qmin",
+        str(CQ),
+        "-qmax",
+        str(CQ),
+        "-b:v",
+        "0",
+        "-preset",
+        NVENC_PRESET,
+        "-tag:v",
+        "hvc1",  # compatibilité Apple
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        AUDIO_CODEC,
+        "-b:a",
+        AUDIO_BITRATE,
     ]
     if creation_iso:  # réaffirme un tag existant plausible (sinon -map_metadata suffit)
         cmd += ["-metadata", f"creation_time={creation_iso}"]
@@ -196,8 +342,12 @@ def encode_h265(input_path: Path, output_path: Path,
     return True
 
 
-def remux_to_mkv(input_path: Path, output_path: Path,
-                 creation_iso: str | None, logger: logging.Logger) -> bool:
+def remux_to_mkv(
+    input_path: Path,
+    output_path: Path,
+    creation_iso: str | None,
+    logger: logging.Logger,
+) -> bool:
     """Change seulement le conteneur vers MKV (-c copy) — sans ré-encodage, sans perte.
 
     Tous les flux (vidéo/audio/sous-titres) sont recopiés tels quels, ainsi que
@@ -207,13 +357,18 @@ def remux_to_mkv(input_path: Path, output_path: Path,
     """
     cmd = [
         "ffmpeg",
-        "-i",   str(input_path),
-        "-map", "0",
-        "-map", "-0:d",              # exclut les flux de DONNÉES (ex. 'mett' des
-                                      # vidéos Pixel) que le conteneur MKV ne sait
-                                      # pas muxer -> sinon "Could not write header"
-        "-c",   "copy",
-        "-map_metadata", "0",        # recopie les métadonnées globales (dont creation_time)
+        "-i",
+        str(input_path),
+        "-map",
+        "0",
+        "-map",
+        "-0:d",  # exclut les flux de DONNÉES (ex. 'mett' des
+        # vidéos Pixel) que le conteneur MKV ne sait
+        # pas muxer -> sinon "Could not write header"
+        "-c",
+        "copy",
+        "-map_metadata",
+        "0",  # recopie les métadonnées globales (dont creation_time)
     ]
     if creation_iso:  # réaffirme un tag existant plausible (sinon -map_metadata suffit)
         cmd += ["-metadata", f"creation_time={creation_iso}"]
@@ -240,10 +395,12 @@ def human_size_bytes(size: int) -> str:
 def print_bilan(logger, title: str, stats: dict, label_width: int = 12):
     """Affiche un tableau de bilan trié par nombre de fichiers décroissant."""
     logger.info("  %s :", title)
-    logger.info("    %-*s  %6s  %12s  %6s", label_width, "valeur", "fichiers", "taille", "conv.")
+    logger.info(
+        "    %-*s  %6s  %12s  %6s", label_width, "valeur", "fichiers", "taille", "conv."
+    )
     logger.info("    %s", "-" * (label_width + 32))
     for key, data in sorted(stats.items(), key=lambda x: -x[1]["count"]):
-        converted = f"{data['converted']}" if data['converted'] > 0 else "-"
+        converted = f"{data['converted']}" if data["converted"] > 0 else "-"
         logger.info(
             "    %-*s  %6d  %12s  %6s",
             label_width,
@@ -269,8 +426,9 @@ def rename_jpeg_to_jpg(root: Path, dry_run: bool, logger: logging.Logger) -> Non
     for src in sorted(jpegs):
         target = src.with_suffix(".jpg")
         if target.exists():
-            logger.warning("    collision, ignoré : %s (%s existe déjà)",
-                           src.name, target.name)
+            logger.warning(
+                "    collision, ignoré : %s (%s existe déjà)", src.name, target.name
+            )
             collisions += 1
             continue
         if dry_run:
@@ -283,8 +441,88 @@ def rename_jpeg_to_jpg(root: Path, dry_run: bool, logger: logging.Logger) -> Non
         except OSError as e:
             logger.error("    erreur %s : %s", src.name, e)
             errors += 1
-    logger.info("Renommage .jpeg -> .jpg : %d renommé(s)%s, %d collision(s), %d erreur(s)",
-                renamed, " (simulé)" if dry_run else "", collisions, errors)
+    logger.info(
+        "Renommage .jpeg -> .jpg : %d renommé(s)%s, %d collision(s), %d erreur(s)",
+        renamed,
+        " (simulé)" if dry_run else "",
+        collisions,
+        errors,
+    )
+
+
+def convert_heic_to_jpg(root: Path, dry_run: bool, logger: logging.Logger) -> None:
+    """Convertit les photos HEIC/HEIF -> JPG (décodage Pillow + pillow-heif).
+
+    Les iPhones récents enregistrent en HEIC, format ignoré par le reste du
+    pipeline (02/03 ne traitent que .jpg). On décode en JPEG en CONSERVANT l'EXIF
+    (orientation, date de prise de vue) pour que 02 puisse l'exploiter, sans
+    jamais écraser un .jpg de même nom, puis on supprime l'original HEIC si la
+    conversion a réussi. No-op (avec avertissement) si pillow-heif est absent.
+    """
+    heics = [
+        p
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in HEIC_EXTENSIONS
+    ]
+    if not heics:
+        return
+
+    try:
+        from PIL import Image
+        from pillow_heif import register_heif_opener
+
+        register_heif_opener()
+    except Exception as e:  # noqa: BLE001 — dépendance optionnelle
+        logger.warning(
+            "Conversion HEIC impossible (pillow-heif absent ?) : %s — "
+            "%d fichier(s) laissé(s) tel quel",
+            e,
+            len(heics),
+        )
+        return
+
+    logger.info("Conversion HEIC -> JPG : %d fichier(s) trouvé(s)", len(heics))
+    converted = collisions = errors = 0
+    for src in sorted(heics):
+        target = src.with_suffix(".jpg")
+        if target.exists():
+            logger.warning(
+                "    collision, ignoré : %s (%s existe déjà)", src.name, target.name
+            )
+            collisions += 1
+            continue
+        if dry_run:
+            logger.info("    [DRY RUN] %s -> %s", src.name, target.name)
+            converted += 1
+            continue
+        try:
+            with Image.open(src) as img:
+                exif = img.info.get("exif")  # EXIF d'origine (orientation, date…)
+                img = img.convert("RGB")  # JPEG n'accepte ni alpha ni palette
+                save_kwargs = {"quality": JPEG_QUALITY, "optimize": True}
+                if exif:
+                    save_kwargs["exif"] = exif
+                img.save(target, "JPEG", **save_kwargs)
+            # Reporte la mtime de l'original (chronologie) puis supprime le HEIC.
+            st = src.stat()
+            os.utime(target, (st.st_atime, st.st_mtime))
+            src.unlink()
+            converted += 1
+        except Exception as e:  # noqa: BLE001 — on logue et on continue le batch
+            logger.error("    erreur %s : %s", src.name, e)
+            if target.exists():
+                try:
+                    target.unlink()  # ne pas laisser de JPEG partiel
+                except OSError:
+                    pass
+            errors += 1
+    logger.info(
+        "Conversion HEIC -> JPG : %d converti(s)%s, %d collision(s), %d erreur(s)",
+        converted,
+        " (simulé)" if dry_run else "",
+        collisions,
+        errors,
+    )
 
 
 def main():
@@ -300,12 +538,17 @@ def main():
     logger.info("Source     : %s", SOURCE_DIR.resolve())
     logger.info("Extensions : %s", ", ".join(sorted(EXTENSIONS)))
     logger.info("Sortie     : même dossier que l'original")
-    logger.info("Encodage   : hevc_nvenc (GPU NVIDIA), CQ %d, preset %s", CQ, NVENC_PRESET)
+    logger.info(
+        "Encodage   : hevc_nvenc (GPU NVIDIA), CQ %d, preset %s", CQ, NVENC_PRESET
+    )
     if not DRY_RUN:
         logger.info("Originaux  : supprimés après conversion réussie")
     logger.info("=" * 56)
 
-    # Normalisation des photos (indépendante de ffmpeg) : .jpeg -> .jpg.
+    # Normalisation des photos (indépendante de ffmpeg) : HEIC -> .jpg puis
+    # .jpeg -> .jpg, pour que toute la bibliothèque photo soit en .jpg.
+    if HEIC_TO_JPG:
+        convert_heic_to_jpg(SOURCE_DIR, DRY_RUN, logger)
     if RENAME_JPEG:
         rename_jpeg_to_jpg(SOURCE_DIR, DRY_RUN, logger)
 
@@ -326,7 +569,8 @@ def main():
     # ne sont pas déjà en H.265, ils seront ré-encodés sur place.
     scan_exts = EXTENSIONS | {OUTPUT_SUFFIX}
     candidates = sorted(
-        f for f in SOURCE_DIR.rglob("*")
+        f
+        for f in SOURCE_DIR.rglob("*")
         if f.is_file() and f.suffix.lower() in scan_exts
     )
 
@@ -339,33 +583,38 @@ def main():
 
     # Structures pour le bilan
     # { ".avi": {"count": N, "size": N, "converted": N}, ... }
-    ext_stats   = defaultdict(lambda: {"count": 0, "size": 0, "converted": 0})
+    ext_stats = defaultdict(lambda: {"count": 0, "size": 0, "converted": 0})
     codec_stats = defaultdict(lambda: {"count": 0, "size": 0, "converted": 0})
 
     total_size = 0
     skipped = encoded = remuxed = errors = already_h265 = 0
+    saved_old = saved_new = 0  # cumul tailles avant/après (bilan « espace »)
     start_total = datetime.now()
+    scan_cache = load_scan_cache(SCAN_CACHE_PATH)
+    prewarm_codecs(candidates, scan_cache)  # pré-sonde // les codecs (cache-miss)
 
     for i, input_file in enumerate(candidates, 1):
-        relative    = input_file.relative_to(SOURCE_DIR)
-        ext         = input_file.suffix.lower()
-        src_stat    = input_file.stat()
-        size        = src_stat.st_size
+        relative = input_file.relative_to(SOURCE_DIR)
+        ext = input_file.suffix.lower()
+        src_stat = input_file.stat()
+        size = src_stat.st_size
 
-        codec = get_video_codec(input_file)
+        codec = get_video_codec_cached(input_file, scan_cache)
         codec_label = codec or "inconnu"
 
-        logger.info("[%d/%d] %s (%s)", i, len(candidates), relative, human_size(input_file))
+        logger.info(
+            "[%d/%d] %s (%s)", i, len(candidates), relative, human_size(input_file)
+        )
         logger.info("    → codec détecté : %s", codec_label)
 
         # Comptabilise dans tous les cas
         ext_stats[ext]["count"] += 1
-        ext_stats[ext]["size"]  += size
+        ext_stats[ext]["size"] += size
         codec_stats[codec_label]["count"] += 1
-        codec_stats[codec_label]["size"]  += size
+        codec_stats[codec_label]["size"] += size
 
-        is_mkv  = ext == OUTPUT_SUFFIX
-        is_hevc = codec == "hevc"   # ffprobe nomme le H.265 « hevc »
+        is_mkv = ext == OUTPUT_SUFFIX
+        is_hevc = codec == "hevc"  # ffprobe nomme le H.265 « hevc »
 
         # Objectif : tout finir en H.265 + MKV.
         #   - déjà H.265 + MKV          → rien à faire.
@@ -379,7 +628,7 @@ def main():
 
         # Cible : sur place pour un .mkv (sortie = entrée → fichier temporaire à
         # l'exécution), sinon même nom avec le suffixe .mkv.
-        in_place    = is_mkv
+        in_place = is_mkv
         output_file = input_file if in_place else input_file.with_suffix(OUTPUT_SUFFIX)
 
         # Ne jamais écraser une cible .mkv déjà existante (sauf le cas in-place,
@@ -407,7 +656,7 @@ def main():
             )
             if not in_place:
                 logger.info("    → original serait supprimé après conversion")
-            ext_stats[ext]["converted"]           += 1
+            ext_stats[ext]["converted"] += 1
             codec_stats[codec_label]["converted"] += 1
             if action == "encode":
                 encoded += 1
@@ -419,8 +668,20 @@ def main():
         # ré-encodage sur place, on passe par un fichier temporaire.
         target = (
             input_file.with_name(f"{input_file.stem}.h265tmp{OUTPUT_SUFFIX}")
-            if in_place else output_file
+            if in_place
+            else output_file
         )
+
+        # Garde-fou espace disque : le fichier converti coexiste avec l'original
+        # (temp en sur-place, ou .mkv à côté) jusqu'au remplacement. On exige au
+        # moins la taille de la source libre + une marge, sinon on saute proprement.
+        if not enough_space(target.parent, size + 200 * 1024 * 1024):
+            logger.error(
+                "    ✗ Espace disque insuffisant — fichier ignoré : %s",
+                input_file.name,
+            )
+            skipped += 1
+            continue
 
         t0 = datetime.now()
         if action == "encode":
@@ -430,6 +691,24 @@ def main():
         elapsed = (datetime.now() - t0).seconds
 
         if success:
+            # Garde-fou intégrité : la durée de la sortie doit correspondre à la
+            # source. Un remux/ré-encodage peut renvoyer un code 0 tout en
+            # produisant une vidéo tronquée (flux corrects mais durée amputée) ;
+            # on refuse alors de remplacer/supprimer l'original.
+            in_dur = get_duration(input_file)
+            out_dur = get_duration(target)
+            if in_dur and out_dur and abs(in_dur - out_dur) > max(1.0, 0.01 * in_dur):
+                logger.error(
+                    "    ✗ Durée incohérente (%.0fs → %.0fs) — sortie tronquée, "
+                    "original conservé",
+                    in_dur,
+                    out_dur,
+                )
+                if target.exists():
+                    target.unlink()
+                errors += 1
+                continue
+
             # Cas in-place : on remplace l'original par la version ré-encodée.
             if in_place:
                 try:
@@ -455,13 +734,19 @@ def main():
             # normale ici si l'original n'en avait pas : 01 la complètera.
             written = get_creation_time(final_file)
             if creation_iso and not written:
-                logger.warning("    ⚠️  creation_time existant non conservé dans le MKV")
+                logger.warning(
+                    "    ⚠️  creation_time existant non conservé dans le MKV"
+                )
 
-            verb  = "RÉ-ENCODÉ" if action == "encode" else "REMUXÉ"
+            verb = "RÉ-ENCODÉ" if action == "encode" else "REMUXÉ"
             place = " (sur place)" if in_place else ""
             logger.info(
                 "    ✓ %s%s  →  %s (%s)  [%ds]  date=%s",
-                verb, place, final_file.name, human_size(final_file), elapsed,
+                verb,
+                place,
+                final_file.name,
+                human_size(final_file),
+                elapsed,
                 written or "à compléter par 01",
             )
             # Pour un autre conteneur, l'original est distinct de la sortie :
@@ -481,7 +766,14 @@ def main():
                         input_file.name,
                         e,
                     )
-            ext_stats[ext]["converted"]           += 1
+            # Cumul pour le bilan « espace » (conversion menée à terme).
+            try:
+                saved_old += size
+                saved_new += final_file.stat().st_size
+            except OSError:
+                pass
+
+            ext_stats[ext]["converted"] += 1
             codec_stats[codec_label]["converted"] += 1
             if action == "encode":
                 encoded += 1
@@ -495,6 +787,7 @@ def main():
             errors += 1
 
     elapsed_total = (datetime.now() - start_total).seconds
+    save_scan_cache(SCAN_CACHE_PATH, scan_cache)
 
     # ── Bilan final ─────────────────────────────────────────
     logger.info("")
@@ -506,23 +799,38 @@ def main():
     logger.info("  Déjà H.265 (ignorés)  : %d", already_h265)
     logger.info("  Ignorés (cible exist.): %d", skipped)
     logger.info("  Taille à convertir    : %s", human_size_bytes(total_size))
+    if saved_old > 0:
+        saved = saved_old - saved_new
+        pct = 100 * saved / saved_old
+        logger.info(
+            "  Espace économisé      : %s → %s  (gain %s, %.1f%%)",
+            human_size_bytes(saved_old),
+            human_size_bytes(saved_new),
+            human_size_bytes(saved),
+            pct,
+        )
     logger.info("")
 
     print_bilan(logger, "Par extension", ext_stats, label_width=8)
     logger.info("")
-    print_bilan(logger, "Par codec",     codec_stats, label_width=14)
+    print_bilan(logger, "Par codec", codec_stats, label_width=14)
     logger.info("")
 
     if DRY_RUN:
         logger.info(
             "  Dry run terminé  —  %d ré-encodage(s) + %d remux = %d fichier(s)",
-            encoded, remuxed, encoded + remuxed,
+            encoded,
+            remuxed,
+            encoded + remuxed,
         )
         logger.info("  Mettez DRY_RUN = False pour lancer la conversion.")
     else:
         logger.info(
             "  Terminé en %ds  —  %d ré-encodé(s), %d remuxé(s), %d erreur(s)",
-            elapsed_total, encoded, remuxed, errors,
+            elapsed_total,
+            encoded,
+            remuxed,
+            errors,
         )
         logger.info("  Log : %s", SOURCE_DIR / "conversion.log")
     logger.info("=" * 56)

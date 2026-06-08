@@ -23,7 +23,7 @@ The codebase (comments, log messages) is written in **French**. Match that langu
 
 - `ffmpeg`/`ffprobe` — used by both pipelines (codec detection, remux, re-encode).
 - **NVENC / GPU** — all H.265 encoding uses `hevc_nvenc` (NVIDIA GPU only, **no CPU fallback**). The image is based on `nvidia/cuda:*-runtime`; the proprietary `libnvidia-encode` is injected at runtime by nvidia-container-toolkit. Containers must be launched with GPU access **and** `NVIDIA_DRIVER_CAPABILITIES=all` (the launchers do this) — `--gpus all` alone only exposes compute/utility, not the encoder.
-- `Pillow` + `piexif` — perso pipeline only (photo resize in 03, EXIF dates in 02).
+- `Pillow` + `piexif` + `pillow-heif` — perso pipeline only (photo resize in 03, EXIF dates in 02, HEIC/HEIF→JPG decode in 01).
 - `rclone` — perso upload (step 04).
 - `tzdata` + `ENV TZ=Europe/Paris` — so log timestamps are Paris time, not UTC.
 
@@ -57,8 +57,8 @@ Four numbered steps, **all configured from one file**, [00-config.py](src/perso-
 
 The steps (each operates on the `photos` share, skipping folders whose name starts with `_`):
 
-1. [01-convert-to-mkv+h265.py](src/perso-media/01-convert-to-mkv+h265.py) — **format normalization only**. Every video ends up **H.265 + MKV** regardless of source codec/container (re-encodes non-HEVC, including existing `.mkv`, in place via temp + `os.replace`; remuxes already-HEVC). Renames `.jpeg`→`.jpg`. **Preserves existing date tags but never infers them** (that is step 02's job). NVENC-only; aborts if no GPU encoder.
-2. [02-enrich-movies-photos-with-date.py](src/perso-media/02-enrich-movies-photos-with-date.py) — **all date inference**. Fills missing capture dates from, in priority order: an existing tag → the filename (patterns like `YYYYMMDD_HHMMSS` and `2022-06-19 at 21.59.44`) → a neighboring photo's date in the same folder → a parent `YY.MM` folder name → file mtime. Photos via `piexif`, videos via ffprobe/ffmpeg.
+1. [01-convert-to-mkv+h265.py](src/perso-media/01-convert-to-mkv+h265.py) — **format normalization only**. Every video ends up **H.265 + MKV** regardless of source codec/container (re-encodes non-HEVC, including existing `.mkv`, in place via temp + `os.replace`; remuxes already-HEVC). Normalizes photos too: decodes **HEIC/HEIF→JPG** (iPhone, EXIF preserved) and renames `.jpeg`→`.jpg`. **Preserves existing date tags but never infers them** (that is step 02's job). NVENC-only; aborts if no GPU encoder. Verifies output **duration** matches the source before deleting the original.
+2. [02-enrich-movies-photos-with-date.py](src/perso-media/02-enrich-movies-photos-with-date.py) — **all date inference**. Fills missing capture dates from, in priority order: an existing tag → a **Google Takeout JSON sidecar** (`*.json` with `photoTakenTime`) → the filename (patterns like `YYYYMMDD_HHMMSS` and `2022-06-19 at 21.59.44`) → a neighboring photo's date in the same folder → a parent `YY.MM` folder name → file mtime. Photos via `piexif`, videos via ffprobe/ffmpeg.
 3. [03-compress-for-gphotos.py](src/perso-media/03-compress-for-gphotos.py) — write a **compressed copy** to `output/gphotos` (photos resized so the long side ≤ `COMPRESS_MAX_PHOTO_SIZE`, videos re-encoded to `COMPRESS_VIDEO_HEIGHT`p via NVENC). Only ever produces `.jpg` + `.mkv`. `ImageFile.LOAD_TRUNCATED_IMAGES = True` to survive slightly-truncated JPEGs.
 4. [04-upload-to-gphotos.sh](src/perso-media/04-upload-to-gphotos.sh) — **rclone** upload of `output/gphotos` to Google Photos; each first-level folder becomes an album of the same name. Replaces the old Python uploader (archived in `src/archives/`). Reads `UPLOAD_*` + `DRY_RUN` from `00-config.py`; OAuth credentials come from `env/rclone.conf` (see Configuration).
 
@@ -74,10 +74,13 @@ The orchestrator mounts the perso scripts live (`-v src/perso-media:/work`), so 
 
 ## Script conventions
 
-- **`DRY_RUN` gates every mutating operation** (rename, delete, write, upload). `True` = simulate and log, change nothing. **Each pipeline has a single `DRY_RUN` in its own `00-config.py`** (no env vars) driving all its steps. Always check it before running anything destructive — step 01 deletes originals after conversion, and 04 publishes to the internet.
+- **`DRY_RUN` gates every mutating operation** (rename, delete, write, upload). `True` = simulate and log, change nothing. **Each pipeline has a single `DRY_RUN` in its own `00-config.py`** driving all its steps. The launchers also accept **`--dry-run` / `--real`** to override it for a single run without editing the file — they export `PIPELINE_DRY_RUN` (1/0), which every step honours above `00-config.py`. Always check it before running anything destructive — step 01 deletes originals after conversion, and 04 publishes to the internet.
 - A `setup_logging()` / `log()` helper with **timestamped, Paris-timezone** output (the image sets `TZ=Europe/Paris`; some scripts also pin the logging converter to `Europe/Paris`).
 - All H.265 encoding is **NVENC-only** — no CPU/libx265 fallback. A script aborts rather than silently encoding on CPU.
 - Rename/move operations detect **collisions** before applying and report a final tally.
+- **Data-safety guards before deleting an original**: stream-count *and* **duration** of the output must match the source; a **disk-space** check precedes every re-encode/compress.
+- **Scan cache + parallelism**: the convert steps memoise per-file codec/dimensions in a gitignored `.scan-cache.json` (keyed by mtime+size) and probe with a thread pool, so repeated runs don't re-`ffprobe` the whole library. Photo compression (03) is parallelised; video/GPU work stays serial. All tunable in `00-config.py` (`CONVERT_SCAN_CACHE`, `CONVERT_SCAN_WORKERS`, `COMPRESS_PHOTO_WORKERS`).
+- **End-of-run notification**: set `NOTIFY_WEBHOOK` (ntfy/webhook URL) in `00-config.py` and the launcher POSTs a success/failure summary via `notify.py` (no-op when unset).
 
 ## Configuration
 
