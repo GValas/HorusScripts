@@ -72,6 +72,18 @@ Run it with the orchestrator:
 
 The orchestrator mounts the perso scripts live (`-v src/perso-media:/work`), so editing `00-config.py` takes effect **without rebuilding** the image. It runs the container with `--user "$(id -u):$(id -g)"` so generated files are owned by you, not root.
 
+## The web GUI (`src/gui/`)
+
+A small **local web app** to launch, monitor and configure both pipelines from a browser instead of the CLI. **Stdlib-only Python** (`http.server`) — no pip deps on the host, consistent with the rest of the repo. It runs on the **host** (it must invoke `docker`/the launchers), reuses no business logic of its own, and **shells out to the two `run-*-pipeline.sh` launchers** in a subprocess.
+
+- [src/gui/server.py](src/gui/server.py) — threaded HTTP server. A single global `RunManager` enforces **one run at a time** (GPU/Docker are serial), buffers log lines, and streams them over **SSE** (`/api/stream`). Runs are launched with `start_new_session=True`; **Stop** sends `SIGINT` to the process group (so `docker compose`/`docker run` shut down cleanly), escalating to `SIGKILL` after ~12s. The `PIPELINES` dict is the single source of truth for each pipeline's launcher, config path, steps, and **editable config fields** (whitelisted; typed `bool`/`int`/`str`/`str_or_none`/`list`/`choice`).
+- [src/gui/index.html](src/gui/index.html) — one self-contained page (vanilla JS, no build step). Tabs per pipeline; dry-run/real selector (mapped to the launchers' `--dry-run`/`--real` flags, real prompts to confirm); step checkboxes (`01/02/03/04`) for perso; live log console; a form to edit the `00-config.py`.
+- [run-gui.sh](run-gui.sh) — launcher: `./run-gui.sh [PORT] [HOST]` (default `8765` on `0.0.0.0`).
+
+**Config editing is a targeted regex rewrite**, not a full re-serialization: it reads current values via `importlib` (same as the launchers) and rewrites only the whitelisted assignment lines, **preserving comments and formatting** (writes via temp + `os.replace`). `INPUT_FOLDERS` entries under `NAS_MOUNT` are re-emitted as `f"{NAS_MOUNT}/…"`. When adding an editable field, add it to the pipeline's `fields` list in `PIPELINES` — the UI and the rewriter are both driven from there.
+
+The mode selector always passes `-y` plus an explicit `--dry-run`/`--real` override, so the GUI's choice wins over `00-config.py`'s `DRY_RUN` for that run. Default binding is `0.0.0.0` (LAN-reachable); since the GUI can trigger destructive runs, only expose it on a trusted network or bind `127.0.0.1`. On WSL2 the auto-detected IP is the internal NAT IP — reaching it from a phone needs a Windows `netsh portproxy`.
+
 ## Script conventions
 
 - **`DRY_RUN` gates every mutating operation** (rename, delete, write, upload). `True` = simulate and log, change nothing. **Each pipeline has a single `DRY_RUN` in its own `00-config.py`** driving all its steps. The launchers also accept **`--dry-run` / `--real`** to override it for a single run without editing the file — they export `PIPELINE_DRY_RUN` (1/0), which every step honours above `00-config.py`. Always check it before running anything destructive — step 01 deletes originals after conversion, and 04 publishes to the internet.

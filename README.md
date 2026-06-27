@@ -79,6 +79,44 @@ produits t'appartiennent) :
 
 ---
 
+## Interface web — pilotage des deux pipelines
+
+Une petite **appli web locale** ([`src/gui/`](src/gui/)) permet de lancer et
+suivre les pipelines depuis un navigateur, plutôt qu'en ligne de commande. Elle
+est en **Python stdlib uniquement** (aucune dépendance pip sur l'hôte) et ne
+réimplémente aucune logique : elle **appelle les lanceurs ci-dessus** en
+sous-processus et streame leurs logs.
+
+```bash
+./run-gui.sh                  # http://127.0.0.1:8765 (écoute aussi le LAN)
+./run-gui.sh 9000             # autre port
+./run-gui.sh 8765 127.0.0.1   # local uniquement (pas d'accès réseau)
+```
+
+Depuis la page tu peux :
+
+- **lancer** un pipeline en mode **simulation (dry-run)** ou **réel** (mappé sur
+  les flags `--dry-run`/`--real` des lanceurs ; le mode réel demande confirmation) ;
+- choisir le **sous-ensemble d'étapes** `01/02/03/04` pour le perso (le public
+  enchaîne `01 → 02`) ;
+- suivre les **logs en direct** (Server-Sent Events) avec l'état et le code de sortie ;
+- **arrêter** un run en cours (`SIGINT` au groupe de processus, escalade `SIGKILL`) ;
+- **éditer les `00-config.py`** (NVENC, workers, `PHOTOS_SRC`/`NAS_MOUNT`,
+  `INPUT_FOLDERS`, webhook…) via un formulaire ; la réécriture est ciblée et
+  préserve commentaires et mise en forme.
+
+Un seul run à la fois (le GPU/Docker travaillent en série). Recharger la page
+pendant un run reprend le suivi des logs.
+
+> ⚠️ Par défaut le serveur écoute sur `0.0.0.0` (accessible depuis le LAN).
+> L'interface peut déclencher des opérations **destructrices** → à n'exposer que
+> sur un réseau de confiance ; sinon binder sur `127.0.0.1` (3ᵉ argument).
+> Pour y accéder depuis un téléphone sous **WSL2**, l'IP affichée est l'IP interne
+> WSL (NAT) : il faut un `netsh interface portproxy` depuis Windows vers cette IP,
+> puis viser l'IP LAN du PC Windows.
+
+---
+
 ## Prérequis hôte (une seule fois)
 
 ### GPU NVIDIA (les deux pipelines encodent en NVENC)
@@ -218,6 +256,7 @@ python src/public-media/02-convert-to-h265.py
 HorusScripts/
 ├── run-public-media-pipeline.sh           # Lanceur public (docker compose)
 ├── run-perso-media-pipeline.sh          # Lanceur perso (orchestre 01→04 en docker run)
+├── run-gui.sh                            # Lanceur de l'interface web (sert src/gui)
 ├── src/
 │   ├── public-media/
 │   │   ├── 00-config.py            # Réglages centralisés des 2 scripts
@@ -229,6 +268,9 @@ HorusScripts/
 │   │   ├── 02-enrich-movies-photos-with-date.py
 │   │   ├── 03-compress-for-gphotos.py
 │   │   └── 04-upload-to-gphotos.sh # Upload rclone → Google Photos
+│   ├── gui/                        # Interface web locale (stdlib)
+│   │   ├── server.py               # Serveur HTTP + moteur de run + édition config
+│   │   └── index.html              # Page unique (onglets, logs live, formulaires)
 │   └── archives/                   # Scratch gitignoré (ancien uploader, audits, CSV)
 ├── env/
 │   └── rclone.conf / .example      # Auth Google Photos (rclone.conf gitignored)
