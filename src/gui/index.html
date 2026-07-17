@@ -249,6 +249,16 @@ async function doRun() {
     const what = p.steps ? `étapes ${steps.join(" ")}` : "01 → 02";
     if (!confirm(`Mode RÉEL sur « ${p.label} » (${what}).\nOpérations destructrices possibles. Continuer ?`)) return;
   }
+  // Enregistre d'abord la config affichée : le lanceur relit 00-config.py sur le
+  // disque, donc sans cette sauvegarde les modifs du formulaire seraient ignorées.
+  const payload = {};
+  p.fields.forEach(f => payload[f.key] = readField(CURRENT, f));
+  try {
+    await api("POST", "/api/config/" + CURRENT, payload);
+  } catch (e) {
+    alert("Échec de l'enregistrement de la config (lancement annulé) : " + e.message);
+    return;
+  }
   try {
     $("#console").textContent = "";
     await api("POST", "/api/run", {pipeline: CURRENT, mode, steps});

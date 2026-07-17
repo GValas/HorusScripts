@@ -24,3 +24,6 @@ dry_run.log
 
 # Dossier de sortie de compress-for-gphotos.py (copies compressées)
 output/
+
+# Worktrees Claude Code — locaux, non versionnés
+.claude/worktrees/
