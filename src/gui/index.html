@@ -42,7 +42,7 @@
   @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
   .field { display: flex; flex-direction: column; gap: 4px; }
   .field label { font-size: 13px; color: var(--fg); }
-  .field .help { font-size: 11.5px; color: var(--muted); }
+  .field .help, .panel > .help { font-size: 11.5px; color: var(--muted); }
   .field input[type=text], .field input[type=number], .field select, .field textarea {
     background: var(--bg); color: var(--fg); border: 1px solid var(--line);
     border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit; }
@@ -213,9 +213,15 @@ async function render() {
   cfgPanel.append(el("div", {class: "row", style: "margin-top:14px"}, saveBtn, toast));
   panels.append(cfgPanel);
 
-  // valeurs courantes
+  // valeurs courantes (00-config.py + surcouche 00-config.local.py)
   try {
-    const {values} = await api("GET", "/api/config/" + CURRENT);
+    const {values, overlay} = await api("GET", "/api/config/" + CURRENT);
+    if (overlay) {
+      cfgPanel.insertBefore(
+        el("div", {class: "help", style: "margin-bottom:10px",
+                   text: "Surcouche active : " + overlay + " — ces valeurs écrasent 00-config.py."}),
+        grid);
+    }
     p.fields.forEach(f => grid.append(fieldInput(CURRENT, f, values[f.key])));
   } catch (e) {
     grid.append(el("div", {class: "toast err", text: "Erreur lecture config : " + e.message}));
@@ -249,8 +255,10 @@ async function doRun() {
     const what = p.steps ? `étapes ${steps.join(" ")}` : "01 → 02";
     if (!confirm(`Mode RÉEL sur « ${p.label} » (${what}).\nOpérations destructrices possibles. Continuer ?`)) return;
   }
-  // Enregistre d'abord la config affichée : le lanceur relit 00-config.py sur le
-  // disque, donc sans cette sauvegarde les modifs du formulaire seraient ignorées.
+  // Enregistre d'abord la config affichée dans la surcouche 00-config.local.py :
+  // le lanceur relit la config sur le disque, donc sans cette sauvegarde les
+  // modifs du formulaire seraient ignorées. Le 00-config.py versionné, lui,
+  // n'est jamais réécrit — plus de bruit dans git à chaque lancement.
   const payload = {};
   p.fields.forEach(f => payload[f.key] = readField(CURRENT, f));
   try {
@@ -280,7 +288,7 @@ async function saveConfig(pipeline, p) {
   const toast = $("#cfgToast");
   try {
     await api("POST", "/api/config/" + pipeline, payload);
-    toast.className = "toast ok"; toast.textContent = "✓ Enregistré dans 00-config.py";
+    toast.className = "toast ok"; toast.textContent = "✓ Enregistré dans 00-config.local.py";
   } catch (e) {
     toast.className = "toast err"; toast.textContent = "✗ " + e.message;
   }

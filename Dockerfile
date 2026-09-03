@@ -39,15 +39,12 @@ RUN pip install --no-cache-dir --break-system-packages Pillow piexif pillow-heif
 ENV TZ=Europe/Paris
 
 WORKDIR /app
-# Les scripts public (01/02 + 00-config.py) ne sont PAS copiés ici : le lanceur
-# run-public-media-pipeline.sh les monte en LIVE dans /work via docker-compose (comme le
-# pipeline perso). Les y baker collisionnerait d'ailleurs avec le 00-config.py
-# perso ci-dessous (même cible /app/00-config.py) et chargerait la mauvaise config.
-# 00-config.py doit être à côté des scripts perso (chargé via Path(__file__)).
-COPY src/perso-media/00-config.py ./00-config.py
-COPY src/perso-media/03-compress-for-gphotos.py ./03-compress-for-gphotos.py
-# Upload Google Photos via rclone (lit 00-config.py à côté pour SRC/DRY_RUN).
-COPY src/perso-media/04-upload-to-gphotos.sh ./04-upload-to-gphotos.sh
+# AUCUN script ni config n'est copié dans l'image : les deux lanceurs montent
+# toujours le dossier du pipeline en LIVE sur /work (-w /work) et exécutent
+# depuis là. Les fichiers autrefois copiés ici (00-config.py, 03, 04) n'étaient
+# jamais exécutés — mais figeaient dans l'image une config qui divergeait
+# silencieusement du dépôt. L'image ne fournit plus que l'environnement
+# (ffmpeg/NVENC, Python + Pillow/piexif/pillow-heif, rclone, fuseau).
 
 # Logs en direct (docker compose logs -f), sans bufferisation
 ENV PYTHONUNBUFFERED=1

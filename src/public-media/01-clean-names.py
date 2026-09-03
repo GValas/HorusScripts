@@ -6,29 +6,27 @@ import os
 import re
 import sys
 import logging
-import importlib.util
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common  # noqa: E402
 
 ##################################################################
 ## Configuration : tout est dans 00-config.py (COMMUN + CLEAN_*)
 ##################################################################
 
-_spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py")
-)
-config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(config)
+config = _common.load_config(__file__)
 
 ROOTS = config.INPUT_FOLDERS  # dossiers parcourus récursivement
-DRY_RUN = config.DRY_RUN  # True = simulation, False = renommage réel
-TECH_WORDS = config.CLEAN_TECH_WORDS  # mots techniques retirés des noms
-
-# Surcharge CLI : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
-# --real), prime sur 00-config.py — pratique pour un run ponctuel sans éditer
+# DRY_RUN effectif : PIPELINE_DRY_RUN (exporté par le lanceur via --dry-run /
+# --real) prime sur 00-config.py — pratique pour un run ponctuel sans éditer
 # (ni risquer d'oublier de remettre) la config.
-_dr = os.environ.get("PIPELINE_DRY_RUN")
-if _dr is not None:
-    DRY_RUN = _dr == "1"
+DRY_RUN = _common.resolve_dry_run(config)
+TECH_WORDS = config.CLEAN_TECH_WORDS  # mots techniques retirés des noms
+VIDEO_EXTENSIONS = config.CLEAN_VIDEO_EXTENSIONS
+SUBTITLE_EXTENSIONS = config.CLEAN_SUBTITLE_EXTENSIONS
+LANG_TOKENS = config.CLEAN_SUBTITLE_LANG_TOKENS
+RENAMED_EXTENSIONS = VIDEO_EXTENSIONS | SUBTITLE_EXTENSIONS
 
 ##################################################################
 
@@ -55,11 +53,17 @@ def get_movies_dirs(roots):
 
 
 def get_movies_titles(roots):
+    """Fichiers candidats au renommage : uniquement les vidéos et sous-titres.
+
+    Les jaquettes, .nfo et autres fichiers annexes sont laissés intacts — les
+    renommer n'apporte rien et risque de casser les références des médiathèques.
+    """
     alls = set()
     for root in roots:
         for rootdir, dirnames, filenames in os.walk(root):
-            filepath = [os.path.join(rootdir, f) for f in filenames]
-            alls.update(filepath)
+            for f in filenames:
+                if os.path.splitext(f)[1].lower() in RENAMED_EXTENSIONS:
+                    alls.add(os.path.join(rootdir, f))
     return alls
 
 
@@ -67,15 +71,19 @@ def clean_movies_dir(dir: str) -> str:
     dir_name = os.path.dirname(dir)
     base_name = os.path.basename(dir)
 
-    base_name = re.sub(r"[()\s\-_]", ".", base_name)
-    base_name = re.sub(r"\.{2,}", ".", base_name)
+    cleaned = re.sub(r"[()\s\-_]", ".", base_name)
+    cleaned = re.sub(r"\.{2,}", ".", cleaned)
 
-    words = base_name.split(".")
+    words = cleaned.split(".")
     words = [w.capitalize() for w in words if w]
-    base_name = ".".join(words)
-    base_name = re.sub(r"^\.", "", base_name)
+    cleaned = ".".join(words)
+    cleaned = re.sub(r"^\.", "", cleaned)
 
-    return os.path.join(dir_name, base_name)
+    # Garde-fou : un nettoyage qui viderait le nom laisse le dossier tel quel.
+    if not cleaned:
+        return dir
+
+    return os.path.join(dir_name, cleaned)
 
 
 def clean_movie_title(title: str) -> str:
@@ -87,6 +95,11 @@ def clean_movie_title(title: str) -> str:
     if not name:
         return title  # pas d'extension reconnue, on ne touche pas
 
+    # Seuls les médias et leurs sous-titres sont renommés (garde-fou doublant
+    # le filtrage de get_movies_titles) : une jaquette ou un .nfo reste intact.
+    if f".{ext.lower()}" not in RENAMED_EXTENSIONS:
+        return title
+
     # normalise séparateurs
     name = re.sub(r"[()\s\-_]", ".", name)
     name = re.sub(r"\.{2,}", ".", name)
@@ -94,14 +107,21 @@ def clean_movie_title(title: str) -> str:
     # reconstruit en s'arrêtant au premier mot technique
     words = name.split(".")
     result = []
-    for word in words:
+    cut_at = None
+    for i, word in enumerate(words):
         if word.lower() in TECH_WORDS:
+            cut_at = i
             break
         # épisode de série : S01E01, S01E01E02, 1x01 ...
         if RE_EPISODE.match(word.lower()):
             result.append(word.upper())
         else:
             result.append(word.capitalize())
+
+    # Garde-fou : un nom entièrement composé de jetons techniques (« 1080p.mkv »)
+    # donnerait un nom VIDE, donc un fichier caché « .mkv ». On ne touche pas.
+    if not result:
+        return title
 
     new_name = ".".join(result)
 
@@ -110,6 +130,23 @@ def clean_movie_title(title: str) -> str:
 
     # nettoie les points résiduels en début/fin
     new_name = new_name.strip(".")
+    if not new_name:
+        return title
+
+    # Sous-titres : ré-attache les jetons de langue/variante situés APRÈS la
+    # coupure technique. Sans ça « Film.2019.1080p.fr.srt » et
+    # « Film.2019.1080p.en.srt » visent tous deux « Film.(2019).srt » : la
+    # deuxième piste est perdue et la première n'est plus identifiable.
+    if f".{ext.lower()}" in SUBTITLE_EXTENSIONS and cut_at is not None:
+        seen = set()
+        langs = []
+        for word in words[cut_at:]:
+            low = word.lower()
+            if low in LANG_TOKENS and low not in seen:
+                seen.add(low)
+                langs.append(low)
+        if langs:
+            new_name = ".".join([new_name, *langs])
 
     new_title = f"{new_name}.{ext}"
     return os.path.join(dir_name, new_title)
@@ -151,11 +188,16 @@ def apply_renames(olds, news, logger, dry_run: bool):
         # remplace silencieusement le fichier de destination sous POSIX.
         # On tolère le simple changement de casse (même fichier sous-jacent sur
         # un système insensible à la casse) via os.path.samefile.
-        if os.path.exists(new) and not os.path.samefile(old, new):
-            logger.warning(
-                "CIBLE EXISTE : '%s' existe déjà → '%s' non renommé", new, old
-            )
-            skipped += 1
+        try:
+            if os.path.exists(new) and not os.path.samefile(old, new):
+                logger.warning(
+                    "CIBLE EXISTE : '%s' existe déjà → '%s' non renommé", new, old
+                )
+                skipped += 1
+                continue
+        except OSError as e:  # source disparue entre le scan et le renommage
+            logger.error("ERREUR  %s  |  %s", old, e)
+            errors += 1
             continue
 
         if dry_run:
@@ -172,17 +214,18 @@ def apply_renames(olds, news, logger, dry_run: bool):
     return renamed, skipped, errors
 
 
-if __name__ == "__main__":
-
+def main() -> int:
     logger = setup_logging()
 
     mode = "DRY RUN (simulation)" if DRY_RUN else "RENOMMAGE RÉEL"
     logger.info("=" * 64)
     logger.info("Mode   : %s", mode)
     logger.info("Roots  : %s", ROOTS)
+    if getattr(config, "_OVERLAY_PATH", None):
+        logger.info("Config : surcouche active — %s", config._OVERLAY_PATH)
     logger.info("=" * 64)
 
-    total_renamed = total_skipped = total_errors = 0
+    total_renamed = total_skipped = total_errors = total_collisions = 0
 
     # ── Dossiers ────────────────────────────────────────────
     logger.info("\n── Dossiers ──")
@@ -197,7 +240,8 @@ if __name__ == "__main__":
     r, sk, e = apply_renames(olds, news, logger, DRY_RUN)
     total_renamed += r
     total_skipped += sk
-    total_errors += e + col
+    total_errors += e
+    total_collisions += col
     logger.info(
         "Dossiers : %d renommé(s), %d collision(s), %d ignoré(s) (cible existe), %d erreur(s)",
         r,
@@ -214,7 +258,8 @@ if __name__ == "__main__":
     r, sk, e = apply_renames(olds, news, logger, DRY_RUN)
     total_renamed += r
     total_skipped += sk
-    total_errors += e + col
+    total_errors += e
+    total_collisions += col
     logger.info(
         "Fichiers : %d renommé(s), %d collision(s), %d ignoré(s) (cible existe), %d erreur(s)",
         r,
@@ -226,9 +271,20 @@ if __name__ == "__main__":
     # ── Bilan ────────────────────────────────────────────────
     logger.info("\n" + "=" * 64)
     logger.info("BILAN FINAL")
-    logger.info("  Total renommés : %d", total_renamed)
-    logger.info("  Total ignorés  : %d  (cible déjà existante)", total_skipped)
-    logger.info("  Total erreurs  : %d", total_errors)
+    logger.info("  Total renommés   : %d", total_renamed)
+    logger.info("  Total ignorés    : %d  (cible déjà existante)", total_skipped)
+    logger.info("  Total collisions : %d", total_collisions)
+    logger.info("  Total erreurs    : %d", total_errors)
     if DRY_RUN:
         logger.info("  → Mettez DRY_RUN = False pour appliquer les renommages.")
     logger.info("=" * 64)
+
+    # Code de sortie parlant : le lanceur (set -e + trap ERR) doit pouvoir
+    # distinguer un run propre d'un run en échec, et ne pas notifier « ✅ »
+    # quand rien n'a fonctionné. Les collisions sont signalées mais ne sont pas
+    # des erreurs : rien n'est écrasé, le fichier est simplement laissé en place.
+    return 1 if total_errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

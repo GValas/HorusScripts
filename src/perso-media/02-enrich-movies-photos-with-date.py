@@ -47,30 +47,24 @@ import json
 import shutil
 import logging
 import subprocess
-import importlib.util
 from pathlib import Path
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import piexif
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common  # noqa: E402
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION : tout est dans 00-config.py (ENRICH_*)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py")
-)
-config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(config)
+config = _common.load_config(__file__)
 
 SOURCE = config.PHOTOS_SRC
 EXPORT_CSV = config.ENRICH_EXPORT_CSV
 EXPORT_JSON = config.ENRICH_EXPORT_JSON
-DRY_RUN = config.DRY_RUN
-_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
-if _dr is not None:
-    DRY_RUN = _dr == "1"
+DRY_RUN = _common.resolve_dry_run(config)  # surcharge CLI (--dry-run / --real)
 
 PHOTO_EXTENSIONS = config.PHOTO_EXT
 VIDEO_EXTENSIONS = config.VIDEO_EXT
@@ -86,20 +80,8 @@ NULL_DATE = b"0000:00:00 00:00:00"
 _folder_date_cache: dict[Path, bytes | None] = {}
 
 
-def _use_paris_timezone() -> None:
-    """Force l'heure de Paris dans les timestamps de log, quel que soit le
-    fuseau du système/conteneur (sinon UTC -> décalage de 1-2h)."""
-    try:
-        paris = ZoneInfo("Europe/Paris")
-        logging.Formatter.converter = staticmethod(
-            lambda ts: datetime.fromtimestamp(ts, paris).timetuple()
-        )
-    except Exception:
-        pass  # base de fuseaux indisponible -> heure système par défaut
-
-
 def setup_logging() -> logging.Logger:
-    _use_paris_timezone()
+    _common.use_paris_timezone()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -119,39 +101,10 @@ def _is_plausible_date(dt: datetime) -> bool:
     return MIN_PLAUSIBLE_YEAR <= dt.year <= MAX_PLAUSIBLE_YEAR
 
 
-def _parse_any_date(value) -> datetime | None:
-    """
-    Parse une date dans les formats courants (EXIF, ISO 8601, sortie ffprobe)
-    en datetime naïf. Tolère 'T', fraction de seconde et suffixe de fuseau.
-    Retourne None si aucun format ne correspond.
-    """
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="replace")
-    s = str(value).strip()
-    if not s:
-        return None
-
-    # Normalise : 'T' -> espace, retire la fraction de seconde
-    core = s.replace("T", " ").split(".")[0].strip()
-    # Retire un suffixe de fuseau éventuel ('Z' ou '±hh:mm')
-    if core.endswith("Z"):
-        core = core[:-1].strip()
-    if len(core) >= 6 and core[-6] in "+-" and core[-3] == ":":
-        core = core[:-6].strip()
-
-    for candidate in (core, core[:19]):
-        for fmt in (
-            "%Y-%m-%d %H:%M:%S",
-            "%Y:%m:%d %H:%M:%S",
-            "%Y-%m-%d %H:%M",
-            "%Y-%m-%d",
-            "%Y:%m:%d",
-        ):
-            try:
-                return datetime.strptime(candidate, fmt)
-            except ValueError:
-                continue
-    return None
+# Parsing mutualisé (cf. _common) : un horodatage porteur d'un fuseau ('Z' ou
+# '±hh:mm', ce qu'écrit ffmpeg) est CONVERTI vers l'heure de Paris et non
+# tronqué, sinon les vidéos se décalent de 1 à 2 h dans la chronologie.
+_parse_any_date = _common.parse_any_date
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -377,7 +330,7 @@ def _date_from_takeout_json(filepath: Path) -> bytes | None:
         if not ts:
             continue
         try:
-            dt = datetime.fromtimestamp(int(ts), tz=ZoneInfo("Europe/Paris"))
+            dt = datetime.fromtimestamp(int(ts), tz=_common.PARIS)
         except (ValueError, OverflowError, OSError):
             continue
         dt = dt.replace(tzinfo=None)  # EXIF = heure locale sans fuseau
@@ -448,6 +401,8 @@ def _date_from_folder(filepath: Path) -> bytes | None:
         if sibling == filepath:
             continue
         if sibling.suffix.lower() != PHOTO_EXTENSIONS:
+            continue
+        if _common.is_temp_artifact(sibling):
             continue
         try:
             pic = piexif.load(str(sibling))
@@ -540,9 +495,18 @@ def fix_photo(filepath: Path, info: dict, date: bytes, dry_run: bool) -> str:
     if dry_run:
         return "DRY RUN — serait mis à jour"
 
+    # ORDRE CRITIQUE : sérialiser AVANT de toucher au fichier. `piexif.dump`
+    # échoue sur certains EXIF exotiques ; l'ancien code appelait
+    # `piexif.remove` en premier, si bien qu'un dump raté laissait la photo
+    # définitivement amputée de son EXIF (GPS, orientation, modèle d'appareil)
+    # tout en ne retournant qu'un « erreur écriture ». `piexif.insert` remplace
+    # déjà le segment APP1 : le `remove` préalable était inutile.
     try:
-        piexif.remove(str(filepath))
         exif_bytes = piexif.dump(pic_dict)
+    except Exception as e:
+        return f"erreur sérialisation EXIF (fichier intact): {e}"
+
+    try:
         piexif.insert(exif_bytes, str(filepath))
         return "corrigé ✅"
     except Exception as e:
@@ -561,7 +525,11 @@ def _ffmpeg_set_creation_time(filepath: Path, dt: datetime) -> None:
     relue (ffprobe) et vérifiée avant de remplacer l'original.
     Lève FileNotFoundError si ffmpeg est absent, RuntimeError sinon.
     """
-    iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    # La date résolue est une heure LOCALE (EXIF, nom de fichier, dossier…).
+    # ffmpeg interprète un creation_time sans fuseau comme de l'UTC : l'écrire
+    # tel quel décalerait la vidéo de 1 à 2 h dans Google Photos. On convertit
+    # donc explicitement en UTC suffixé 'Z'.
+    iso = _common.to_utc_iso(dt)
     tmp = filepath.with_name(f"{filepath.stem}.datetmp{filepath.suffix}")
 
     cmd = [
@@ -635,6 +603,11 @@ def scan_and_fix(root: Path, logger: logging.Logger, dry_run: bool) -> list[dict
         f
         for f in all_files
         if f.is_file() and f.suffix.lower() in (PHOTO_EXTENSIONS, VIDEO_EXTENSIONS)
+        # Dossiers de travail « _ » : hors pipeline, comme pour 03/04. 02
+        # écrivait jusqu'ici des dates dans ces fichiers pourtant exclus.
+        and not _common.in_excluded_folder(f, root)
+        # Temporaires d'un run interrompu : jamais des médias.
+        and not _common.is_temp_artifact(f)
     ]
 
     total = len(media_files)
@@ -709,7 +682,8 @@ def print_summary(results: list[dict], logger: logging.Logger, dry_run: bool) ->
 
     if dry_run and fixed > 0:
         logger.info(
-            "💡  C'est un DRY RUN. Passez DRY_RUN=false (env) pour appliquer les corrections."
+            "💡  C'est un DRY RUN. Passez DRY_RUN=False dans 00-config.py, ou "
+            "relancez avec --real, pour appliquer les corrections."
         )
 
 
@@ -749,11 +723,16 @@ def main() -> int:
     logger.info("=" * 64)
     logger.info("Mode    : %s", mode)
     logger.info("Source  : %s", root)
+    if getattr(config, "_OVERLAY_PATH", None):
+        logger.info("Config  : surcouche active — %s", config._OVERLAY_PATH)
     logger.info("=" * 64)
 
     if not root.is_dir():
         logger.error("Répertoire source introuvable : %s", root)
         return 1
+
+    # Orphelins .h265tmp/.datetmp d'un run interrompu : à nettoyer avant le scan.
+    _common.purge_temp_artifacts(root, DRY_RUN, logger)
 
     if not _ffmpeg_available():
         logger.warning(
@@ -772,7 +751,12 @@ def main() -> int:
             json.dump(results, f, ensure_ascii=False, indent=2)
         logger.info("📄  Rapport JSON enregistré : %s", EXPORT_JSON)
 
-    return 0
+    # Code de sortie parlant : une écriture EXIF/vidéo ratée doit interrompre le
+    # pipeline et faire notifier un échec, pas passer pour un succès.
+    failed = sum(1 for r in results if r["erreur"] or "erreur" in r["action"])
+    if failed:
+        logger.error("%d fichier(s) en erreur d'écriture ou de lecture", failed)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

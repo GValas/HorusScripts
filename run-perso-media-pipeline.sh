@@ -26,12 +26,10 @@ SCRIPTS_DIR="$PWD/src/perso-media"
 RCLONE_CONF="$PWD/env/rclone.conf"
 USERSPEC="$(id -u):$(id -g)"
 
-# Tous les réglages viennent de 00-config.py (source de vérité commune).
-read_cfg() {
-  python3 -c "import importlib.util,pathlib; \
-s=importlib.util.spec_from_file_location('c', pathlib.Path('${SCRIPTS_DIR}/00-config.py')); \
-m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(getattr(m, '$1'))"
-}
+# Tous les réglages viennent de 00-config.py (source de vérité commune), lus
+# via _common.py — même chargement que les scripts, surcouche
+# 00-config.local.py (écrite par l'interface web) comprise.
+read_cfg() { python3 "$SCRIPTS_DIR/_common.py" "$1"; }
 
 # Racine scannée par 01/02/03 : le NAS (/mnt/wsl/horus/photos) OU un dossier
 # Windows (ex. /mnt/c/Users/.../photos-a-trier — Docker Desktop partage les
@@ -96,7 +94,7 @@ run_step() {  # $1 = libellé
 
 # Notification de fin (no-op si NOTIFY_WEBHOOK=None). Sur erreur (set -e), le
 # trap envoie l'échec avec l'étape fautive avant de quitter.
-notify() { python3 "$SCRIPTS_DIR/notify.py" "$1" >/dev/null 2>&1 || true; }
+notify() { python3 "$PWD/src/notify.py" "$SCRIPTS_DIR/00-config.py" "$1" >/dev/null 2>&1 || true; }
 MODE_LABEL="$([ "$DRY_RUN" = "True" ] && echo DRY-RUN || echo RÉEL)"
 trap 'notify "❌ Pipeline perso-media ÉCHEC (étape ${step:-?}, mode ${MODE_LABEL})"' ERR
 

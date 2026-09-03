@@ -23,7 +23,11 @@ Deux scripts enchaînés sur les mêmes dossiers (`INPUT_FOLDERS`) :
 
 1. [`01-clean-names`](src/public-media/01-clean-names.py) — nettoie les noms de
    dossiers/fichiers (retire `1080p`, `x264`…, normalise casse et séparateurs, met
-   l'année entre parenthèses), avec détection de collisions.
+   l'année entre parenthèses), avec détection de collisions. Ne renomme que les
+   **vidéos et leurs sous-titres** (`CLEAN_VIDEO_EXTENSIONS` /
+   `CLEAN_SUBTITLE_EXTENSIONS`) — jaquettes et `.nfo` restent intacts — et
+   **préserve le suffixe de langue** des sous-titres (`…fr.srt` / `…en.srt` ne
+   peuvent plus se retrouver sur le même nom).
 2. [`02-convert-to-h265`](src/public-media/02-convert-to-h265.py) — ré-encode
    récursivement tout ce qui n'est pas déjà en HEVC vers x265 via **NVENC** (GPU
    NVIDIA), conserve toutes les pistes audio/sous-titres, puis **remplace
@@ -49,16 +53,21 @@ contient un bloc COMMUN (un `DRY_RUN` unique, `PHOTO_EXT=.jpg`, `VIDEO_EXT=.mkv`
 réglages NVENC, racine NAS, bornes d'années) puis un bloc par étape.
 
 Chaque étape parcourt le partage `photos` et **ignore les dossiers commençant par
-`_`** :
+`_`**. Les étapes 01 et 02 commencent par **nettoyer les fichiers temporaires**
+(`*.h265tmp.mkv`, `*.datetmp.mkv`) qu'un run interrompu aurait laissés : ils
+portent l'extension `.mkv` et seraient sinon pris pour de vraies vidéos.
 
 1. [`01-convert-to-mkv+h265`](src/perso-media/01-convert-to-mkv+h265.py) —
    **normalisation de format uniquement** : toute vidéo finit en **H.265 + MKV**
    quel que soit le codec/conteneur d'origine (NVENC obligatoire) ; `.jpeg`→`.jpg`.
    Conserve les tags de date existants mais **n'en infère pas** (c'est le rôle de 02).
 2. [`02-enrich-movies-photos-with-date`](src/perso-media/02-enrich-movies-photos-with-date.py) —
-   **inférence des dates** manquantes, par priorité : tag existant → nom de fichier
-   (`YYYYMMDD_HHMMSS`, `2022-06-19 at 21.59.44`…) → photo voisine du même dossier →
-   dossier parent `YY.MM` → date de modification du fichier.
+   **inférence des dates** manquantes, par priorité : tag existant → **sidecar JSON
+   Google Takeout** (`photoTakenTime`) → nom de fichier (`YYYYMMDD_HHMMSS`,
+   `2022-06-19 at 21.59.44`…) → photo voisine du même dossier → dossier parent
+   `YY.MM` → date de modification du fichier. Les dates sont manipulées en heure
+   de Paris et écrites en UTC dans les vidéos (ffmpeg lit `creation_time` comme de
+   l'UTC : écrire une heure locale décalerait la chronologie de 1 à 2 h).
 3. [`03-compress-for-gphotos`](src/perso-media/03-compress-for-gphotos.py) —
    écrit une **copie compressée** dans `output/gphotos` (photos redimensionnées,
    vidéos ré-encodées 720p). Ne produit que `.jpg` + `.mkv`.
@@ -101,9 +110,13 @@ Depuis la page tu peux :
   enchaîne `01 → 02`) ;
 - suivre les **logs en direct** (Server-Sent Events) avec l'état et le code de sortie ;
 - **arrêter** un run en cours (`SIGINT` au groupe de processus, escalade `SIGKILL`) ;
-- **éditer les `00-config.py`** (NVENC, workers, `PHOTOS_SRC`/`NAS_MOUNT`,
-  `INPUT_FOLDERS`, webhook…) via un formulaire ; la réécriture est ciblée et
-  préserve commentaires et mise en forme.
+- **éditer les réglages** (NVENC, workers, `PHOTOS_SRC`/`NAS_MOUNT`,
+  `INPUT_FOLDERS`, webhook…) via un formulaire. Les valeurs sont écrites dans une
+  **surcouche `00-config.local.py`** (gitignorée, générée), chargée *après*
+  `00-config.py` par les scripts comme par les lanceurs. Le fichier versionné
+  n'est jamais réécrit : plus de bruit dans `git status` à chaque lancement, et
+  supprimer la surcouche suffit à revenir aux valeurs par défaut. Un bandeau
+  signale la surcouche quand elle est active.
 
 Un seul run à la fois (le GPU/Docker travaillent en série). Recharger la page
 pendant un run reprend le suivi des logs.
@@ -207,13 +220,19 @@ par les deux scripts via `importlib` — même principe que le pipeline perso.
 |---|---|---|
 | `NAS_MOUNT` | `/mnt/wsl/horus` | Point de montage NAS (monté tel quel dans le conteneur) |
 | `INPUT_FOLDERS` | `…/tvshows`, `…/movies`, `…/cartoons` | Dossiers à scanner (doivent être **sous** `NAS_MOUNT`) |
-| `DRY_RUN` | `False` | `True` = simulation, aucun fichier renommé/écrit/supprimé |
+| `DRY_RUN` | `True` | `True` = simulation, aucun fichier renommé/écrit/supprimé |
 | `CONVERT_CQ` | `26` | Qualité NVENC (plus bas = meilleur, 24–28 conseillé) |
 | `CONVERT_PRESET` | `p4` | Préréglage NVENC, `p1` (rapide) → `p7` (qualité) |
 | `CONVERT_EXTENSIONS` | `.mkv .mp4 .avi .m4v .mov` | Conteneurs vidéo scannés |
 | `CONVERT_SKIP_SUFFIX` | `_x265` | Suffixe des fichiers déjà convertis (ignorés) |
 | `CONVERT_MAX_RESOLUTION` | `None` | Résolution max de sortie (`"720p"`, `"1080p"`, `"1440p"`, `"2160p"`/`"4k"`). Les fichiers plus grands sont downscalés (HDR 10-bit préservé, Dolby Vision perdu). `None` = pas de downscale |
 | `CLEAN_TECH_WORDS` | (liste) | Mots techniques retirés des noms par 01 |
+| `CLEAN_VIDEO_EXTENSIONS` | `.mkv .mp4 .avi …` | Vidéos renommées par 01 |
+| `CLEAN_SUBTITLE_EXTENSIONS` | `.srt .ass .sub …` | Sous-titres renommés par 01 (suffixe de langue préservé) |
+| `CLEAN_SUBTITLE_LANG_TOKENS` | (liste) | Jetons de langue/variante ré-attachés aux sous-titres (`fr`, `en`, `forced`…) |
+| `CONVERT_SCAN_CACHE` | `.scan-cache.json` | Cache ffprobe (codec/dimensions), sauvegardé périodiquement ; `None` pour désactiver |
+| `CONVERT_SCAN_WORKERS` | `8` | Sondes ffprobe parallèles au scan (l'encodage reste séquentiel) |
+| `NOTIFY_WEBHOOK` | `None` | URL ntfy/webhook notifiée en fin de run (succès **et** échec) |
 
 `NAS_MOUNT` est aussi consommé par `docker compose` pour le mapping de volume :
 le lanceur le lit dans `00-config.py` et l'exporte avant `docker compose up`.
@@ -238,6 +257,25 @@ ni commités** (seul le `.example` à placeholders est versionné).
 
 ---
 
+## Tests
+
+Les fonctions pures (nettoyage de noms, parsing de dates et fuseaux, inférence
+depuis le nom de fichier ou le dossier, cache de scan, surcouche de config) sont
+couvertes par une suite **stdlib**, sans NAS, sans GPU et sans dépendance pip :
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Codes de sortie
+
+Chaque script renvoie **1 si au moins une opération a échoué**, 0 sinon. Les
+lanceurs (`set -e` + `trap ERR`) s'arrêtent alors à l'étape fautive et la
+notification `NOTIFY_WEBHOOK` signale l'échec — un run entièrement raté ne peut
+plus être annoncé comme un succès.
+
+---
+
 ## Dev — lancer dans le dev container
 
 1. Ouvrir le dossier dans VS Code.
@@ -258,12 +296,17 @@ HorusScripts/
 ├── run-perso-media-pipeline.sh          # Lanceur perso (orchestre 01→04 en docker run)
 ├── run-gui.sh                            # Lanceur de l'interface web (sert src/gui)
 ├── src/
+│   ├── notify.py                   # Notification de fin de run (commune aux 2 pipelines)
 │   ├── public-media/
 │   │   ├── 00-config.py            # Réglages centralisés des 2 scripts
+│   │   ├── 00-config.local.py      # Surcouche générée par l'interface web (gitignorée)
+│   │   ├── _common.py              # Config, espace disque, cache de scan (+ lecture CLI)
 │   │   ├── 01-clean-names.py       # Renommage (avant conversion)
 │   │   └── 02-convert-to-h265.py   # Ré-encodage NVENC HEVC
 │   ├── perso-media/
 │   │   ├── 00-config.py            # Réglages centralisés des 4 étapes
+│   │   ├── 00-config.local.py      # Surcouche générée par l'interface web (gitignorée)
+│   │   ├── _common.py              # Config, dates/fuseaux, exclusions, cache de scan
 │   │   ├── 01-convert-to-mkv+h265.py
 │   │   ├── 02-enrich-movies-photos-with-date.py
 │   │   ├── 03-compress-for-gphotos.py
@@ -272,6 +315,7 @@ HorusScripts/
 │   │   ├── server.py               # Serveur HTTP + moteur de run + édition config
 │   │   └── index.html              # Page unique (onglets, logs live, formulaires)
 │   └── archives/                   # Scratch gitignoré (ancien uploader, audits, CSV)
+├── tests/                          # Tests unittest (stdlib, ni NAS ni GPU requis)
 ├── env/
 │   └── rclone.conf / .example      # Auth Google Photos (rclone.conf gitignored)
 ├── .devcontainer/                  # Dev container VS Code

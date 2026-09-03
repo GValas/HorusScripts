@@ -10,9 +10,10 @@ ni env/.env), exactement comme le pipeline perso :
       01-clean-names.py      -> CLEAN_*
       02-convert-to-h265.py  -> CONVERT_*
 
-Les deux scripts chargent ce fichier via importlib (le nom « 00-config.py »,
-avec chiffres et tiret, n'est pas importable directement) ; le lanceur
-run-public-media-pipeline.sh lit NAS_MOUNT / DRY_RUN via un petit appel python3.
+Chargement : les deux scripts et le lanceur passent par _common.load_config() —
+ce fichier PUIS la surcouche 00-config.local.py si elle existe (générée par
+l'interface web, gitignorée, et qui écrase les valeurs ci-dessous). Le lanceur
+lit NAS_MOUNT / DRY_RUN avec `python3 src/public-media/_common.py CLE`.
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -29,21 +30,19 @@ NAS_MOUNT = "/mnt/wsl/horus"
 
 # Dossiers parcourus récursivement, l'un après l'autre (total global en fin de run).
 INPUT_FOLDERS = [
-    f"{NAS_MOUNT}/tvshows",
     f"{NAS_MOUNT}/movies",
-    f"{NAS_MOUNT}/cartoons",
 ]
 
 # Interrupteur UNIQUE de simulation, commun aux deux scripts :
 #   True  = simulation (aucun renommage ni conversion, rien d'écrit/supprimé) ;
 #   False = exécution réelle — ATTENTION : 02 SUPPRIME les originaux après
 #           conversion réussie.
-DRY_RUN = False
+DRY_RUN = True
 
 # Notification de fin de pipeline (les runs durent souvent des heures). URL d'un
 # webhook recevant le message de bilan en POST (texte brut) — ex. ntfy.sh :
 # "https://ntfy.sh/mon-canal-prive". None = aucune notification (défaut).
-# Le lanceur appelle src/public-media/notify.py en fin de run (succès ET échec).
+# Le lanceur appelle src/notify.py en fin de run (succès ET échec).
 NOTIFY_WEBHOOK = None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -62,6 +61,34 @@ CLEAN_TECH_WORDS = set(
         "imax multi multitruefrench proper repack subfrench truefrench vff vostfr web "
         "webdl webdl1080p webrip x264 x265 xvid "
         "hevc h265 h.265 h.264 remux 10bit hc vf vo nf amzn yify "
+    ).split()
+)
+
+# Extensions RENOMMÉES par 01. Tout le reste (jaquettes .jpg, .nfo, .txt…) est
+# laissé strictement intact : le nettoyage vise les médias et leurs sous-titres,
+# pas les fichiers annexes d'un dossier de film.
+CLEAN_VIDEO_EXTENSIONS = {
+    ".mkv",
+    ".mp4",
+    ".avi",
+    ".m4v",
+    ".mov",
+    ".mpg",
+    ".mpeg",
+    ".wmv",
+}
+CLEAN_SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt"}
+
+# Jetons de LANGUE / VARIANTE des sous-titres. La coupure au premier mot
+# technique emporterait sinon le suffixe de langue (« Film.2019.1080p.fr.srt »
+# -> « Film.(2019).srt »), ce qui fait entrer en collision les pistes fr et en
+# et en fait perdre une. Ces jetons sont donc ré-ajoutés en fin de nom, dans
+# leur ordre d'origine, pour les seuls fichiers de sous-titres.
+CLEAN_SUBTITLE_LANG_TOKENS = set(
+    (
+        "fr fre fra fren french en eng english es spa spanish de ger deu german "
+        "it ita italian pt por nl dut ned ja jpn jp ko kor zh chi cn ru rus ar "
+        "forced sdh hi cc default "
     ).split()
 )
 

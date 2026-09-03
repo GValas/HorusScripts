@@ -12,9 +12,11 @@ Tout se règle ici, en variables Python (aucune variable d'environnement) :
   L'upload (04-upload-to-gphotos.sh, basé sur rclone) ne lit que DRY_RUN ;
   son authentification est gérée par rclone, hors de ce fichier.
 
-Les scripts Python chargent ce fichier via importlib (les noms numérotés avec
-tirets/« + » ne sont pas importables directement) ; le script .sh lit DRY_RUN
-via un petit appel python3.
+Chargement : tous les points d'entrée (scripts Python, lanceur, script .sh)
+passent par _common.load_config() — ce fichier PUIS la surcouche
+00-config.local.py si elle existe (générée par l'interface web, gitignorée, et
+qui écrase les valeurs ci-dessous). Les lanceurs lisent une clé isolée avec
+`python3 src/perso-media/_common.py CLE`.
 """
 
 from pathlib import Path
@@ -59,7 +61,7 @@ MAX_PLAUSIBLE_YEAR = 2100
 # Notification de fin de pipeline (les runs durent souvent des heures). URL d'un
 # webhook recevant le message de bilan en POST (texte brut) — ex. ntfy.sh :
 # "https://ntfy.sh/mon-canal-prive". None = aucune notification (défaut).
-# Le lanceur appelle src/perso-media/notify.py en fin de run (succès ET échec).
+# Le lanceur appelle src/notify.py en fin de run (succès ET échec).
 NOTIFY_WEBHOOK = None
 
 # ══════════════════════════════════════════════════════════════════════════════

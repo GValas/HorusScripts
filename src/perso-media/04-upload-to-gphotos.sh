@@ -22,13 +22,14 @@ set -euo pipefail
 # où ils sont copiés ensemble). TOUS les réglages viennent de là -> chemins
 # corrects en local (output/gphotos absolu) ET en conteneur (/output/gphotos),
 # sans hypothèse sur le répertoire courant.
-CONFIG="$(cd "$(dirname "$0")" && pwd)/00-config.py"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="${SCRIPT_DIR}/00-config.py"
 
-read_cfg() {
-  python3 -c "import importlib.util,pathlib; \
-s=importlib.util.spec_from_file_location('c', pathlib.Path('${CONFIG}')); \
-m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(getattr(m, '$1'))"
-}
+# Lecture déléguée à _common.py (à côté) : même chargement que les scripts
+# Python — 00-config.py PUIS la surcouche 00-config.local.py écrite par
+# l'interface web. Sans ça l'upload utiliserait des réglages différents du reste
+# du pipeline.
+read_cfg() { python3 "${SCRIPT_DIR}/_common.py" "$1"; }
 
 SRC="$(read_cfg COMPRESS_OUTPUT)"   # = dossier de sortie produit par 03
 DRY_RUN="$(read_cfg DRY_RUN)"

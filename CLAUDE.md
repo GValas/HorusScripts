@@ -10,6 +10,13 @@ A personal toolkit for managing a home NAS named **horus** (SMB/CIFS share holdi
 - **`src/perso-media/`** — a 4-step personal photo/video pipeline (normalize → date → compress → upload to Google Photos). Config-file-driven, run via the **`run-perso-media-pipeline.sh`** orchestrator.
 - **`src/archives/`** — gitignored scratch: the old Python uploader (`04-…py.bak`), one-off audit scripts, and generated CSV reports. Not part of any pipeline; nothing imports it.
 
+Each pipeline directory also holds a `_common.py` (config loading, disk-space
+guard, scan cache, and — for perso — date/timezone helpers and the `_`/temp-file
+exclusions). It is **per-pipeline on purpose**: a container mounts only one
+pipeline directory on `/work`, so a module at the root of `src/` would not be
+visible. The one genuinely shared script, [src/notify.py](src/notify.py), runs on
+the *host* and takes the target pipeline's config path as its first argument.
+
 Both pipelines share a **single Docker image** (`horus-convert-h265`, built from [Dockerfile](Dockerfile)) that bakes in every dependency. The two launchers at the repo root are the entry points:
 
 - [run-public-media-pipeline.sh](run-public-media-pipeline.sh) — public pipeline (via `docker compose`).
@@ -37,12 +44,12 @@ Everything runs in Linux/containers and targets the NAS at **`/mnt/wsl/horus`**.
 
 ## The public pipeline (`src/public-media/`)
 
-Two stdlib-only scripts (ffmpeg/ffprobe binaries aside), **all configured from one file**, [00-config.py](src/public-media/00-config.py) — same principle as the perso pipeline, no env vars. It holds a COMMON section (`NAS_MOUNT`, `INPUT_FOLDERS`, single `DRY_RUN`) plus a per-script section (`CLEAN_*` for 01, `CONVERT_*` for 02). Both scripts load it via `importlib` (the `00-config.py` filename has digits/`-`, so it isn't importable directly).
+Two stdlib-only scripts (ffmpeg/ffprobe binaries aside), **all configured from one file**, [00-config.py](src/public-media/00-config.py) — same principle as the perso pipeline, no env vars. It holds a COMMON section (`NAS_MOUNT`, `INPUT_FOLDERS`, single `DRY_RUN`) plus a per-script section (`CLEAN_*` for 01, `CONVERT_*` for 02). Both scripts load it through `_common.load_config()` — `importlib` under the hood (the `00-config.py` filename has digits/`-`, so it isn't importable directly), plus the `00-config.local.py` overlay.
 
-- [01-clean-names.py](src/public-media/01-clean-names.py) — rename movies/shows: strip technical tokens (codecs, resolutions, release groups) and apply naming conventions. Detects **collisions** (two names mapping to the same target) before applying.
+- [01-clean-names.py](src/public-media/01-clean-names.py) — rename movies/shows: strip technical tokens (codecs, resolutions, release groups) and apply naming conventions. Detects **collisions** (two names mapping to the same target) before applying. Only **video and subtitle** extensions are renamed (`CLEAN_VIDEO_EXTENSIONS` / `CLEAN_SUBTITLE_EXTENSIONS`) — artwork and `.nfo` are left alone — and a subtitle's **language suffix is re-attached** after the technical cut (`CLEAN_SUBTITLE_LANG_TOKENS`), otherwise `…fr.srt` and `…en.srt` collapse onto the same target and one track is lost. A name made entirely of technical tokens is left untouched rather than becoming an empty (hidden) filename.
 - [02-convert-to-h265.py](src/public-media/02-convert-to-h265.py) — re-encode to HEVC via NVENC, with colorized timestamped logging and stream-count verification.
 
-The compose service `convert-h265` mounts `src/public-media` live at `/work` and runs them in sequence: `python3 01-clean-names.py && python3 02-convert-to-h265.py`. The launcher reads `NAS_MOUNT`/`DRY_RUN` from `00-config.py` (small inline `python3` call), exports `NAS_MOUNT` so compose can interpolate the volume bind, and prompts to confirm if `DRY_RUN=False` (02 deletes originals).
+The compose service `convert-h265` mounts `src/public-media` live at `/work` and runs them in sequence: `python3 01-clean-names.py && python3 02-convert-to-h265.py`. The launcher reads `NAS_MOUNT`/`DRY_RUN` via `python3 src/public-media/_common.py KEY` (overlay included), exports `NAS_MOUNT` so compose can interpolate the volume bind and `HOST_UID`/`HOST_GID` so the container doesn't write as root, and prompts to confirm if `DRY_RUN=False` (02 deletes originals).
 
 Run it:
 
@@ -53,14 +60,14 @@ Run it:
 
 ## The perso pipeline (`src/perso-media/`)
 
-Four numbered steps, **all configured from one file**, [00-config.py](src/perso-media/00-config.py). There are no env vars and no per-script config blocks — `00-config.py` holds a COMMON section (single `DRY_RUN`, `PHOTO_EXT=.jpg`, `VIDEO_EXT=.mkv`, NVENC `VIDEO_CQ`/`VIDEO_PRESET`, `PHOTOS_SRC`, plausible-year bounds) plus a per-script section (`CONVERT_*`, `ENRICH_*`, `COMPRESS_*`, `UPLOAD_*`). Python steps load it via `importlib` (filenames contain digits/`+`/`-`, so they aren't importable directly); the shell step reads values via a small inline `python3` call.
+Four numbered steps, **all configured from one file**, [00-config.py](src/perso-media/00-config.py). There are no env vars and no per-script config blocks — `00-config.py` holds a COMMON section (single `DRY_RUN`, `PHOTO_EXT=.jpg`, `VIDEO_EXT=.mkv`, NVENC `VIDEO_CQ`/`VIDEO_PRESET`, `PHOTOS_SRC`, plausible-year bounds) plus a per-script section (`CONVERT_*`, `ENRICH_*`, `COMPRESS_*`, `UPLOAD_*`). Python steps load it through `_common.load_config()` (filenames contain digits/`+`/`-`, so they aren't importable directly); the launcher and the shell step read individual keys with `python3 src/perso-media/_common.py KEY` — same loading, overlay included.
 
-The steps (each operates on the `photos` share, skipping folders whose name starts with `_`):
+The steps (each operates on the `photos` share, skipping folders whose name starts with `_` — enforced by `_common.in_excluded_folder`; 01 and 02 used to ignore this rule and write to `_` folders anyway). Steps 01 and 02 also start by purging orphan `*.h265tmp.mkv` / `*.datetmp.mkv` left by an interrupted run: they carry the library extension and would otherwise be treated as real videos and end up on Google Photos.
 
-1. [01-convert-to-mkv+h265.py](src/perso-media/01-convert-to-mkv+h265.py) — **format normalization only**. Every video ends up **H.265 + MKV** regardless of source codec/container (re-encodes non-HEVC, including existing `.mkv`, in place via temp + `os.replace`; remuxes already-HEVC). Normalizes photos too: decodes **HEIC/HEIF→JPG** (iPhone, EXIF preserved) and renames `.jpeg`→`.jpg`. **Preserves existing date tags but never infers them** (that is step 02's job). NVENC-only; aborts if no GPU encoder. Verifies output **duration** matches the source before deleting the original.
+1. [01-convert-to-mkv+h265.py](src/perso-media/01-convert-to-mkv+h265.py) — **format normalization only**. Re-encodes with an explicit `-map 0:v:0 -map 0:a?` (ffmpeg's default selection keeps only *one* audio track), preserves **10-bit/HDR** (main10 + bt2020/PQ signalling) instead of flattening everything to 8-bit `yuv420p`, and **copies audio** already in an MKV-muxable compressed codec instead of re-encoding it to AAC. Every video ends up **H.265 + MKV** regardless of source codec/container (re-encodes non-HEVC, including existing `.mkv`, in place via temp + `os.replace`; remuxes already-HEVC). Normalizes photos too: decodes **HEIC/HEIF→JPG** (iPhone, EXIF preserved) and renames `.jpeg`→`.jpg`. **Preserves existing date tags but never infers them** (that is step 02's job). NVENC-only; aborts if no GPU encoder. Verifies output **duration** matches the source before deleting the original.
 2. [02-enrich-movies-photos-with-date.py](src/perso-media/02-enrich-movies-photos-with-date.py) — **all date inference**. Fills missing capture dates from, in priority order: an existing tag → a **Google Takeout JSON sidecar** (`*.json` with `photoTakenTime`) → the filename (patterns like `YYYYMMDD_HHMMSS` and `2022-06-19 at 21.59.44`) → a neighboring photo's date in the same folder → a parent `YY.MM` folder name → file mtime. Photos via `piexif`, videos via ffprobe/ffmpeg.
 3. [03-compress-for-gphotos.py](src/perso-media/03-compress-for-gphotos.py) — write a **compressed copy** to `output/gphotos` (photos resized so the long side ≤ `COMPRESS_MAX_PHOTO_SIZE`, videos re-encoded to `COMPRESS_VIDEO_HEIGHT`p via NVENC). Only ever produces `.jpg` + `.mkv`. `ImageFile.LOAD_TRUNCATED_IMAGES = True` to survive slightly-truncated JPEGs.
-4. [04-upload-to-gphotos.sh](src/perso-media/04-upload-to-gphotos.sh) — **rclone** upload of `output/gphotos` to Google Photos; each first-level folder becomes an album of the same name. Replaces the old Python uploader (archived in `src/archives/`). Reads `UPLOAD_*` + `DRY_RUN` from `00-config.py`; OAuth credentials come from `env/rclone.conf` (see Configuration).
+4. [04-upload-to-gphotos.sh](src/perso-media/04-upload-to-gphotos.sh) — **rclone** upload of `output/gphotos` to Google Photos; each first-level folder becomes an album of the same name. Replaces the old Python uploader (archived in `src/archives/`). Reads `UPLOAD_*` + `DRY_RUN` via the neighbouring `_common.py`; OAuth credentials come from `env/rclone.conf` (see Configuration).
 
 Run it with the orchestrator:
 
@@ -80,7 +87,9 @@ A small **local web app** to launch, monitor and configure both pipelines from a
 - [src/gui/index.html](src/gui/index.html) — one self-contained page (vanilla JS, no build step). Tabs per pipeline; dry-run/real selector (mapped to the launchers' `--dry-run`/`--real` flags, real prompts to confirm); step checkboxes (`01/02/03/04`) for perso; live log console; a form to edit the `00-config.py`.
 - [run-gui.sh](run-gui.sh) — launcher: `./run-gui.sh [PORT] [HOST]` (default `8765` on `0.0.0.0`).
 
-**Config editing is a targeted regex rewrite**, not a full re-serialization: it reads current values via `importlib` (same as the launchers) and rewrites only the whitelisted assignment lines, **preserving comments and formatting** (writes via temp + `os.replace`). `INPUT_FOLDERS` entries under `NAS_MOUNT` are re-emitted as `f"{NAS_MOUNT}/…"`. When adding an editable field, add it to the pipeline's `fields` list in `PIPELINES` — the UI and the rewriter are both driven from there.
+**Config editing writes a generated overlay, never the tracked file**: `write_overlay()` reads the current effective values (`00-config.py` + existing overlay, same as the launchers) and re-serializes every whitelisted field into `00-config.local.py` (temp + `os.replace`). The previous regex rewrite of `00-config.py` produced a `git status` diff on every launch and mangled any value containing a `#` (taken for a comment). When adding an editable field, add it to the pipeline's `fields` list in `PIPELINES` — the UI, the overlay writer and its `_literal()` serializer are all driven from there.
+
+The log buffer is a bounded `deque` (`MAX_LOG_LINES`) with an absolute `total` counter: a multi-hour run emits hundreds of thousands of lines, and an unbounded list grew the server's memory without limit while every new SSE client replayed the whole thing. SSE cursors are absolute, so a client that falls behind gets a "lignes tronquées" marker instead of a silent gap.
 
 The mode selector always passes `-y` plus an explicit `--dry-run`/`--real` override, so the GUI's choice wins over `00-config.py`'s `DRY_RUN` for that run. Default binding is `0.0.0.0` (LAN-reachable); since the GUI can trigger destructive runs, only expose it on a trusted network or bind `127.0.0.1`. On WSL2 the auto-detected IP is the internal NAT IP — reaching it from a phone needs a Windows `netsh portproxy`.
 
@@ -90,11 +99,26 @@ The mode selector always passes `-y` plus an explicit `--dry-run`/`--real` overr
 - A `setup_logging()` / `log()` helper with **timestamped, Paris-timezone** output (the image sets `TZ=Europe/Paris`; some scripts also pin the logging converter to `Europe/Paris`).
 - All H.265 encoding is **NVENC-only** — no CPU/libx265 fallback. A script aborts rather than silently encoding on CPU.
 - Rename/move operations detect **collisions** before applying and report a final tally.
-- **Data-safety guards before deleting an original**: stream-count *and* **duration** of the output must match the source; a **disk-space** check precedes every re-encode/compress.
-- **Scan cache + parallelism**: the convert steps memoise per-file codec/dimensions in a gitignored `.scan-cache.json` (keyed by mtime+size) and probe with a thread pool, so repeated runs don't re-`ffprobe` the whole library. Photo compression (03) is parallelised; video/GPU work stays serial. All tunable in `00-config.py` (`CONVERT_SCAN_CACHE`, `CONVERT_SCAN_WORKERS`, `COMPRESS_PHOTO_WORKERS`).
-- **End-of-run notification**: set `NOTIFY_WEBHOOK` (ntfy/webhook URL) in `00-config.py` and the launcher POSTs a success/failure summary via `notify.py` (no-op when unset).
+- **Data-safety guards before deleting an original**: stream-count *and* **duration** of the output must match the source; a **disk-space** check precedes every re-encode/compress. An **unreadable output duration counts as a failure** — that is exactly what ffprobe returns for a badly truncated file, and treating it as "check skipped" would delete the original.
+- **Every script exits non-zero when anything failed.** The launchers rely on `set -e` + `trap ERR` to stop at the failing step and notify a failure; a script that always returns 0 makes a fully failed run indistinguishable from a clean one.
+- **Never destroy before you can rebuild**: e.g. `piexif.dump()` runs *before* touching the photo — the previous order (`piexif.remove()` first) left photos stripped of GPS/orientation whenever the dump raised.
+- **Dates are handled in Paris local time and written to video containers in UTC** (`_common.parse_any_date` / `to_utc_iso`). ffmpeg reads a bare `creation_time` as UTC, so writing local time shifts the whole library by 1–2 h in Google Photos. Never truncate a timezone suffix — convert it.
+- **Scan cache + parallelism**: the convert steps memoise per-file codec/dimensions in a gitignored `.scan-cache.json` (keyed by mtime+size, versioned, written atomically and **flushed periodically** so an interrupted multi-hour run doesn't lose the scan; stale entries are pruned at the end) and probe with a thread pool, so repeated runs don't re-`ffprobe` the whole library. Photo compression (03) is parallelised; video/GPU work stays serial. All tunable in `00-config.py` (`CONVERT_SCAN_CACHE`, `CONVERT_SCAN_WORKERS`, `COMPRESS_PHOTO_WORKERS`).
+- **End-of-run notification**: set `NOTIFY_WEBHOOK` (ntfy/webhook URL) in `00-config.py` and the launcher POSTs a success/failure summary via `python3 src/notify.py <config> "<message>"` (no-op when unset). One shared script for both pipelines — it used to be duplicated byte-for-byte.
 
 ## Configuration
+
+Every entry point — the scripts, both launchers, `04-upload-to-gphotos.sh`, the
+GUI — loads config the same way, via `_common.load_config()`: **`00-config.py`
+first, then `00-config.local.py` if present**, executed in the same namespace so
+the latter overrides. That overlay is gitignored and **entirely generated by the
+web GUI**; the tracked `00-config.py` is never rewritten, so the repo stays clean
+across runs. Deleting the overlay restores the tracked defaults. Scripts log
+`surcouche active — …` when one is in effect — check for it before concluding
+that an edit to `00-config.py` had no effect.
+
+Launchers read individual keys with `python3 src/<pipeline>/_common.py KEY`,
+which applies the same overlay — never re-implement the loading inline.
 
 - **Public:** edit [src/public-media/00-config.py](src/public-media/00-config.py) directly — no env vars. Set `NAS_MOUNT` (= `/mnt/wsl/horus`), `INPUT_FOLDERS`, `DRY_RUN`, and NVENC `CONVERT_CQ`/`CONVERT_PRESET`. The launcher exports `NAS_MOUNT` (read from this file) so `docker compose` can interpolate the volume bind.
 - **Perso:** edit [src/perso-media/00-config.py](src/perso-media/00-config.py) directly — no env vars.
@@ -113,16 +137,31 @@ export NAS_MOUNT=/mnt/wsl/horus && docker compose up convert-h265
 ./run-perso-media-pipeline.sh
 ```
 
+The image contains **no project script or config** — both launchers always mount the pipeline directory live on `/work` and run from there. Copying files into `/app` only froze a config that then silently diverged from the repo. The compose service runs as `${HOST_UID}:${HOST_GID}` (exported by the launcher), matching the perso pipeline's `--user`, so generated files (`conversion.log`, `.scan-cache.json`) belong to you and not to root.
+
 `docker-compose.yml` defines only the `convert-h265` service; the perso pipeline deliberately does **not** go through compose (it needs per-step volume/GPU/user variations that the orchestrator applies in `docker run`). The image's default `CMD` is a neutral "use a launcher" message, so running the bare image does nothing destructive.
 
 `black` runs on save in the dev container (`editor.formatOnSave`). Keep code black-formatted.
 
+## Tests
+
+`python3 -m unittest discover -s tests -v` — stdlib only, no NAS, no GPU, no pip
+dependency (piexif is stubbed to import the enrich step). They cover the pure
+functions that produced silent bugs: name cleaning, date/timezone parsing,
+filename- and folder-derived dates, the scan cache, and the config overlay. Add a
+case here rather than reasoning about these by hand.
+
 ## NAS mounting (WSL host — `/etc/`)
 
-The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from `/etc/wsl.conf` (`[boot] command = /etc/mount-nas-horus.sh`). Both files live in `/etc/`, **not in this repo** (host/machine config, require `sudo` to edit). The script mounts the CIFS shares (`photos movies tvshows cartoons`) from `//192.168.1.182` using `~/.nas-credentials` (hardcoded — it does **not** read any pipeline config).
+The NAS is mounted at WSL boot by `/etc/mount-nas-horus.sh`, called from
+`/etc/wsl.conf`. Both live in `/etc/`, **not in this repo** (machine config,
+`sudo` to edit). **[README.md](README.md#prérequis-hôte-une-seule-fois) holds the
+full explanation and the script to copy** — it is not duplicated here.
 
-Key trick: Docker Desktop runs in a separate WSL distro that only sees Ubuntu's FS via `/mnt/wsl` (propagation `shared`). A CIFS mount under `/mnt/horus` is invisible in containers, so the script mounts the real CIFS under `/mnt/wsl/horus/*` (Docker-visible, `--make-shared`) and bind-mirrors it to `/mnt/horus/*` for convenience. It is idempotent (guards each mount with `mountpoint -q`) and can be re-run by hand.
-
-**`NAS_MOUNT` must be `/mnt/wsl/horus`, never `/mnt/horus`.** `docker-compose.yml` bind-mounts `${NAS_MOUNT}:${NAS_MOUNT}` into the container. Docker Desktop only resolves host paths under `/mnt/wsl`; a bind on `/mnt/horus` captures the **empty ext4 mountpoint directory** (the CIFS submounts don't propagate to Docker's distro), so the container sees empty `movies/tvshows/...` folders. `/mnt/wsl/horus` is the shared CIFS mount Docker can actually see — and it also works for local (non-container) runs, so use it everywhere.
-
-The CIFS lines in `/etc/fstab` are neutralized (commented) because they mounted with `private` propagation under `/mnt/horus`, invisible to containers. Backups exist as `/etc/wsl.conf.bak` and `/etc/fstab.bak`. After editing `/etc/wsl.conf`, validate the boot trigger with `wsl --shutdown` (PowerShell) then relaunch Ubuntu.
+The one rule that matters when editing this repo: **`NAS_MOUNT` must be
+`/mnt/wsl/horus`, never `/mnt/horus`.** Docker Desktop runs in a separate WSL
+distro that only sees Ubuntu's FS through `/mnt/wsl`; a CIFS mount under
+`/mnt/horus` has `private` propagation, so `docker-compose.yml`'s
+`${NAS_MOUNT}:${NAS_MOUNT}` bind would capture the **empty ext4 mountpoint** and
+the container would see empty `movies/tvshows/…` folders. This applies to local
+runs too, so use `/mnt/wsl/horus` everywhere.

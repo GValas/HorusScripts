@@ -21,16 +21,15 @@
 import os
 import sys
 import json
-import shutil
 import logging
 import subprocess
-import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageFile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common  # noqa: E402
 
 # Tolère les JPEG légèrement tronqués (quelques octets manquants en fin de
 # fichier) : Pillow complète au lieu d'échouer. Sans ça, ces fichiers sont
@@ -41,18 +40,11 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 ## Configuration : tout est dans 00-config.py (COMPRESS_*)
 ##################################################################
 
-_spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py")
-)
-config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(config)
+config = _common.load_config(__file__)
 
 SOURCE = config.PHOTOS_SRC
 OUTPUT = config.COMPRESS_OUTPUT
-DRY_RUN = config.DRY_RUN
-_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
-if _dr is not None:
-    DRY_RUN = _dr == "1"
+DRY_RUN = _common.resolve_dry_run(config)  # surcharge CLI (--dry-run / --real)
 MAX_PHOTO_SIZE = config.COMPRESS_MAX_PHOTO_SIZE
 JPEG_QUALITY = config.COMPRESS_JPEG_QUALITY
 VIDEO_HEIGHT = config.COMPRESS_VIDEO_HEIGHT
@@ -67,20 +59,8 @@ PHOTO_WORKERS = getattr(
 ##################################################################
 
 
-def _use_paris_timezone() -> None:
-    """Force l'heure de Paris dans les timestamps de log, quel que soit le
-    fuseau du système/conteneur (sinon UTC -> décalage de 1-2h)."""
-    try:
-        paris = ZoneInfo("Europe/Paris")
-        logging.Formatter.converter = staticmethod(
-            lambda ts: datetime.fromtimestamp(ts, paris).timetuple()
-        )
-    except Exception:
-        pass  # base de fuseaux indisponible -> heure système par défaut
-
-
 def setup_logging() -> logging.Logger:
-    _use_paris_timezone()
+    _common.use_paris_timezone()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -90,16 +70,7 @@ def setup_logging() -> logging.Logger:
     return logging.getLogger(__name__)
 
 
-def enough_space(target_dir: Path, needed: int) -> bool:
-    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
-
-    Indéterminé (erreur OS) -> True : on ne bloque pas une compression par excès
-    de prudence si l'espace libre n'a pas pu être lu.
-    """
-    try:
-        return shutil.disk_usage(target_dir).free >= needed
-    except OSError:
-        return True
+enough_space = _common.enough_space
 
 
 def copy_mtime(src: Path, dst: Path) -> None:
@@ -256,15 +227,7 @@ def compress_video(src: Path, dst: Path, logger: logging.Logger) -> bool:
     return True
 
 
-def in_excluded_folder(src: Path, source_root: Path) -> bool:
-    """
-    Vrai si le fichier est sous un dossier dont le nom commence par « _ »
-    (ex. _to_be_sorted/). Ces dossiers de travail/brouillon ne doivent pas
-    partir vers Google Photos. Seuls les composants de dossier SOUS la racine
-    sont testés (la racine elle-même est ignorée).
-    """
-    rel = src.relative_to(source_root)
-    return any(part.startswith("_") for part in rel.parts[:-1])
+in_excluded_folder = _common.in_excluded_folder
 
 
 def target_for(src: Path, source_root: Path, output_root: Path):
@@ -289,6 +252,8 @@ def main() -> int:
     logger.info("Mode    : %s", mode)
     logger.info("Source  : %s", source_root)
     logger.info("Sortie  : %s", output_root)
+    if getattr(config, "_OVERLAY_PATH", None):
+        logger.info("Config  : surcouche active — %s", config._OVERLAY_PATH)
     logger.info("Photos  : .jpg, max %dpx, JPEG q%d", MAX_PHOTO_SIZE, JPEG_QUALITY)
     logger.info(
         "Vidéos  : .mkv -> %dp, hevc_nvenc CQ %d, preset %s",
@@ -314,6 +279,14 @@ def main() -> int:
         # Ignore les dossiers de travail (nom commençant par « _ »).
         if in_excluded_folder(src, source_root):
             logger.debug("Ignoré (dossier « _ ») : %s", src)
+            excluded += 1
+            continue
+
+        # Temporaires .h265tmp/.datetmp laissés par un 01/02 interrompu : ils
+        # portent l'extension .mkv mais ne sont pas des médias — ne jamais les
+        # compresser ni les envoyer sur Google Photos.
+        if _common.is_temp_artifact(src):
+            logger.warning("Ignoré (temporaire d'un run interrompu) : %s", src)
             excluded += 1
             continue
 
@@ -380,9 +353,13 @@ def main() -> int:
     logger.info("  Non gérées / ignorées: %d", skipped)
     logger.info("  Erreurs              : %d", errors)
     if DRY_RUN:
-        logger.info("  → Mettez DRY_RUN=false (ou env) pour écrire réellement.")
+        logger.info("  → Mettez DRY_RUN=False dans 00-config.py (ou lancez avec")
+        logger.info("    --real) pour écrire réellement.")
     logger.info("=" * 64)
-    return 0
+
+    # Code de sortie parlant : sans lui, une compression entièrement en échec
+    # enchaînerait sur l'upload (04) et serait notifiée comme un succès.
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

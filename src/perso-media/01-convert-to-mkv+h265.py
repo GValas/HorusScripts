@@ -24,29 +24,22 @@ Prérequis : ffmpeg + ffprobe installés et accessibles dans le PATH
 
 import os
 import json
-import shutil
 import subprocess
 import sys
 import logging
-import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pathlib import Path
 from datetime import datetime
-from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common  # noqa: E402
 
 # ── Configuration : tout est dans 00-config.py (CONVERT_*) ──────────────────
-_spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py")
-)
-config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(config)
+config = _common.load_config(__file__)
 
 SOURCE_DIR = Path(config.PHOTOS_SRC)
-DRY_RUN = config.DRY_RUN
-_dr = os.environ.get("PIPELINE_DRY_RUN")  # surcharge CLI (--dry-run / --real)
-if _dr is not None:
-    DRY_RUN = _dr == "1"
+DRY_RUN = _common.resolve_dry_run(config)  # surcharge CLI (--dry-run / --real)
 RENAME_JPEG = config.CONVERT_RENAME_JPEG
 HEIC_TO_JPG = config.CONVERT_HEIC_TO_JPG
 HEIC_EXTENSIONS = config.CONVERT_HEIC_EXTENSIONS
@@ -65,23 +58,33 @@ SCAN_CACHE_PATH = (
     else None
 )
 SCAN_WORKERS = getattr(config, "CONVERT_SCAN_WORKERS", 1)  # sondes // au scan
+# Schéma des entrées du cache (on y stocke désormais pix_fmt / colorimétrie /
+# codecs audio) : à incrémenter pour invalider les caches d'une version antérieure.
+SCAN_CACHE_VERSION = 2
+# Sauvegarde intermédiaire du cache tous les N fichiers sondés (un run
+# interrompu ne doit pas perdre tout le travail de scan).
+SCAN_CACHE_FLUSH_EVERY = 200
+
+# Codecs audio déjà compressés et muxables tels quels en MKV : on les RECOPIE
+# au lieu de les ré-encoder en AAC. Ré-encoder un AAC en AAC est une perte
+# générationnelle gratuite. Tout le reste (PCM des vieux caméscopes, etc.) est
+# ré-encodé en AAC comme avant.
+AUDIO_COPY_OK = {
+    "aac",
+    "ac3",
+    "eac3",
+    "mp3",
+    "opus",
+    "flac",
+    "vorbis",
+    "alac",
+    "dts",
+}
 # ───────────────────────────────────────────────────────────
 
 
-def _use_paris_timezone() -> None:
-    """Force l'heure de Paris dans les timestamps de log, quel que soit le
-    fuseau du système/conteneur (sinon UTC -> décalage de 1-2h)."""
-    try:
-        paris = ZoneInfo("Europe/Paris")
-        logging.Formatter.converter = staticmethod(
-            lambda ts: datetime.fromtimestamp(ts, paris).timetuple()
-        )
-    except Exception:
-        pass  # base de fuseaux indisponible -> heure système par défaut
-
-
 def setup_logging(log_dir: Path, dry_run: bool) -> logging.Logger:
-    _use_paris_timezone()
+    _common.use_paris_timezone()
     log_path = log_dir / ("dry_run.log" if dry_run else "conversion.log")
     logging.basicConfig(
         level=logging.INFO,
@@ -123,63 +126,76 @@ def nvenc_available() -> bool:
     return "hevc_nvenc" in (out.stdout or "")
 
 
-def get_video_codec(path: Path) -> str | None:
+EMPTY_PROPS = {
+    "codec": None,
+    "pix_fmt": None,
+    "color_trc": None,
+    "color_primaries": None,
+    "color_space": None,
+    "audio_codecs": [],
+}
+
+
+def get_video_props(path: Path) -> dict:
+    """Codec vidéo + colorimétrie + codecs audio, en un seul appel ffprobe.
+
+    La colorimétrie sert à préserver le 10 bits / HDR à l'encodage (les iPhone
+    et Pixel récents filment en HLG 10 bits) ; la liste des codecs audio sert à
+    décider si on peut recopier l'audio au lieu de le ré-encoder.
+    """
     cmd = [
         "ffprobe",
         "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=codec_name",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_streams",
         str(path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout.strip() or None
-
-
-def load_scan_cache(path: Path | None) -> dict:
-    """Charge le cache de scan JSON (clé = chemin) ; {} si absent/désactivé."""
-    if not path:
-        return {}
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        streams = (json.loads(result.stdout) or {}).get("streams", [])
+    except Exception:  # noqa: BLE001 — fichier illisible : propriétés vides
+        return dict(EMPTY_PROPS, audio_codecs=[])
+
+    props = dict(EMPTY_PROPS, audio_codecs=[])
+    for stream in streams:
+        kind = stream.get("codec_type", "")
+        name = (stream.get("codec_name") or "").lower()
+        if kind == "video" and props["codec"] is None:
+            props["codec"] = name or None
+            props["pix_fmt"] = stream.get("pix_fmt")
+            props["color_trc"] = stream.get("color_transfer")
+            props["color_primaries"] = stream.get("color_primaries")
+            props["color_space"] = stream.get("color_space")
+        elif kind == "audio":
+            props["audio_codecs"].append(name)
+    return props
 
 
-def save_scan_cache(path: Path | None, cache: dict) -> None:
-    """Écrit le cache de scan (best-effort : une erreur d'écriture est ignorée)."""
-    if not path:
-        return
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-    except OSError:
-        pass
+def save_scan_cache(cache: dict) -> None:
+    """Sauvegarde intermédiaire/finale du cache de scan (best-effort)."""
+    _common.save_scan_cache(SCAN_CACHE_PATH, cache, SCAN_CACHE_VERSION)
 
 
-def get_video_codec_cached(path: Path, cache: dict) -> str | None:
-    """Codec vidéo avec cache validé par (mtime, taille) : évite un ffprobe par
-    fichier déjà connu et inchangé. Sur miss/changement, sonde et mémorise."""
+def get_video_props_cached(path: Path, cache: dict) -> dict:
+    """Propriétés vidéo avec cache validé par (mtime, taille) : évite un ffprobe
+    par fichier déjà connu et inchangé. Sur miss/changement, sonde et mémorise."""
     try:
         st = path.stat()
     except OSError:
-        return get_video_codec(path)
+        return get_video_props(path)
     key = str(path)
     ent = cache.get(key)
-    if ent and ent.get("mtime") == int(st.st_mtime) and ent.get("size") == st.st_size:
-        return ent.get("codec")
-    codec = get_video_codec(path)
-    cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "codec": codec}
-    return codec
+    if _common.cache_entry_valid(ent, st):
+        return ent.get("props") or dict(EMPTY_PROPS, audio_codecs=[])
+    props = get_video_props(path)
+    cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "props": props}
+    return props
 
 
 def prewarm_codecs(candidates: list, cache: dict) -> None:
-    """Pré-sonde en parallèle (ffprobe) le codec des fichiers absents du cache.
+    """Pré-sonde en parallèle (ffprobe) les fichiers absents du cache.
 
     ffprobe est I/O-bound : les threads se recouvrent. Les écritures du cache se
     font dans le thread principal (ex.map yield séquentiel). L'encodage qui suit
@@ -192,35 +208,26 @@ def prewarm_codecs(candidates: list, cache: dict) -> None:
             st = f.stat()
         except OSError:
             continue
-        ent = cache.get(str(f))
-        if not (
-            ent
-            and ent.get("mtime") == int(st.st_mtime)
-            and ent.get("size") == st.st_size
-        ):
+        if not _common.cache_entry_valid(cache.get(str(f)), st):
             misses.append((f, st))
     if not misses:
         return
 
     def work(item):
         f, st = item
-        return str(f), st, get_video_codec(f)
+        return str(f), st, get_video_props(f)
 
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        for key, st, codec in ex.map(work, misses):
-            cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "codec": codec}
+        for i, (key, st, props) in enumerate(ex.map(work, misses), 1):
+            cache[key] = {"mtime": int(st.st_mtime), "size": st.st_size, "props": props}
+            # Flush périodique : sonder une grosse bibliothèque prend des
+            # dizaines de minutes ; une interruption ne doit pas tout perdre.
+            if i % SCAN_CACHE_FLUSH_EVERY == 0:
+                save_scan_cache(cache)
+    save_scan_cache(cache)
 
 
-def enough_space(target_dir: Path, needed: int) -> bool:
-    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
-
-    Indéterminé (erreur OS) -> True : on ne bloque pas une conversion par excès
-    de prudence si l'espace libre n'a pas pu être lu.
-    """
-    try:
-        return shutil.disk_usage(target_dir).free >= needed
-    except OSError:
-        return True
+enough_space = _common.enough_space
 
 
 def get_duration(path: Path) -> float | None:
@@ -258,36 +265,25 @@ def get_creation_time(path: Path) -> str | None:
     return result.stdout.strip() or None
 
 
-def _parse_iso(value: str) -> datetime | None:
-    """Parse une date ffprobe (ISO 8601, éventuellement avec 'T', 'Z' ou fraction)."""
-    core = value.strip().replace("T", " ").split(".")[0].strip()
-    if core.endswith("Z"):
-        core = core[:-1].strip()
-    if len(core) >= 6 and core[-6] in "+-" and core[-3] == ":":  # suffixe ±hh:mm
-        core = core[:-6].strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(core, fmt)
-        except ValueError:
-            continue
-    return None
-
-
 def existing_creation_iso(path: Path) -> str | None:
     """Tag creation_time DÉJÀ présent dans le fichier, à reporter dans le MKV.
 
-    Retourne la date au format ISO 8601, ou None si le fichier n'a pas de tag
-    plausible. 00 se contente de CONSERVER une date existante : aucune inférence
-    (nom de fichier, mtime, photo voisine) — celle-ci est faite ensuite par
-    02-enrich-movies-photos-with-date.py sur le MKV produit. Un tag aberrant
-    (epoch 1904/1970, année < 1990) est ignoré (sera complété par 01).
+    Retourne la date en ISO 8601 UTC (suffixe 'Z'), ou None si le fichier n'a pas
+    de tag plausible. 01 se contente de CONSERVER une date existante : aucune
+    inférence (nom de fichier, mtime, photo voisine) — celle-ci est faite ensuite
+    par 02-enrich-movies-photos-with-date.py sur le MKV produit. Un tag aberrant
+    (epoch 1904/1970, année < 1990) est ignoré (sera complété par 02).
+
+    Le fuseau porté par le tag source est CONVERTI, pas tronqué : réécrire une
+    heure locale sans fuseau la ferait relire comme de l'UTC par ffmpeg, et la
+    vidéo se retrouverait décalée de 1 à 2 h dans Google Photos.
     """
     embedded = get_creation_time(path)
     if not embedded:
         return None
-    dt = _parse_iso(embedded)
+    dt = _common.parse_any_date(embedded)  # -> heure de Paris, naïve
     if dt and dt.year >= MIN_PLAUSIBLE_YEAR:
-        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+        return _common.to_utc_iso(dt)
     return None
 
 
@@ -295,6 +291,7 @@ def encode_h265(
     input_path: Path,
     output_path: Path,
     creation_iso: str | None,
+    props: dict,
     logger: logging.Logger,
 ) -> bool:
     """Ré-encode la vidéo en H.265 sur GPU NVIDIA (NVENC) — tout codec non-H.265.
@@ -302,11 +299,56 @@ def encode_h265(
     Encodage GPU UNIQUEMENT : aucun repli CPU (libx265). Si NVENC est
     indisponible, ffmpeg échoue et l'original est conservé (cf. main(), qui
     vérifie la présence de hevc_nvenc avant tout encodage réel).
+
+    Trois garde-fous de fidélité :
+      - `-map` explicite : sans lui, la sélection par défaut de ffmpeg ne garde
+        qu'UNE piste audio. Toutes les pistes audio sont désormais conservées ;
+      - profondeur/colorimétrie : une source 10 bits ou HDR (HLG des iPhone et
+        Pixel récents) est encodée en main10 avec sa signalisation, au lieu
+        d'être aplatie en 8 bits SDR par un `-pix_fmt yuv420p` inconditionnel ;
+      - audio : recopié tel quel s'il est déjà dans un codec compressé muxable
+        en MKV, plutôt que ré-encodé en AAC (perte générationnelle gratuite).
     """
+    pix_fmt = props.get("pix_fmt") or ""
+    is_10bit = "10" in pix_fmt or "p010" in pix_fmt
+    is_hdr = (
+        props.get("color_trc") in ("smpte2084", "arib-std-b67")
+        or props.get("color_primaries") == "bt2020"
+    )
+
+    if is_hdr or is_10bit:
+        depth_args = ["-pix_fmt", "p010le", "-profile:v", "main10"]
+    else:
+        depth_args = ["-pix_fmt", "yuv420p"]
+
+    color_args = []
+    if is_hdr:
+        color_args = [
+            "-color_primaries",
+            props.get("color_primaries") or "bt2020",
+            "-color_trc",
+            props.get("color_trc") or "smpte2084",
+            "-colorspace",
+            props.get("color_space") or "bt2020nc",
+        ]
+
+    audio_codecs = props.get("audio_codecs") or []
+    if audio_codecs and all(c in AUDIO_COPY_OK for c in audio_codecs):
+        audio_args = ["-c:a", "copy"]
+    else:
+        audio_args = ["-c:a", AUDIO_CODEC, "-b:a", AUDIO_BITRATE]
+
     cmd = [
         "ffmpeg",
         "-i",
         str(input_path),
+        # Vidéo principale + TOUTES les pistes audio (les sous-titres des
+        # vidéos perso sont inexistants et leurs codecs exotiques feraient
+        # échouer le mux : on ne les mappe pas).
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
         "-map_metadata",
         "0",  # recopie les métadonnées globales (dont creation_time)
         "-c:v",
@@ -325,12 +367,9 @@ def encode_h265(
         NVENC_PRESET,
         "-tag:v",
         "hvc1",  # compatibilité Apple
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        AUDIO_CODEC,
-        "-b:a",
-        AUDIO_BITRATE,
+        *depth_args,
+        *color_args,
+        *audio_args,
     ]
     if creation_iso:  # réaffirme un tag existant plausible (sinon -map_metadata suffit)
         cmd += ["-metadata", f"creation_time={creation_iso}"]
@@ -380,16 +419,11 @@ def remux_to_mkv(
     return True
 
 
+human_size_bytes = _common.human_size_bytes
+
+
 def human_size(path: Path) -> str:
     return human_size_bytes(path.stat().st_size)
-
-
-def human_size_bytes(size: int) -> str:
-    for unit in ("o", "Ko", "Mo", "Go"):
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} To"
 
 
 def print_bilan(logger, title: str, stats: dict, label_width: int = 12):
@@ -417,7 +451,13 @@ def rename_jpeg_to_jpg(root: Path, dry_run: bool, logger: logging.Logger) -> Non
     Contenu identique (jpg == jpeg), c'est un simple renommage. Ne jamais
     écraser : si un .jpg de même nom existe déjà, le renommage est ignoré.
     """
-    jpegs = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".jpeg"]
+    jpegs = [
+        p
+        for p in root.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() == ".jpeg"
+        and not _common.in_excluded_folder(p, root)
+    ]
     if not jpegs:
         return
 
@@ -462,7 +502,9 @@ def convert_heic_to_jpg(root: Path, dry_run: bool, logger: logging.Logger) -> No
     heics = [
         p
         for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in HEIC_EXTENSIONS
+        if p.is_file()
+        and p.suffix.lower() in HEIC_EXTENSIONS
+        and not _common.in_excluded_folder(p, root)
     ]
     if not heics:
         return
@@ -530,12 +572,17 @@ def main():
         print(f"Erreur : dossier introuvable — {SOURCE_DIR}")
         sys.exit(1)
 
-    logger = setup_logging(SOURCE_DIR, DRY_RUN)
+    # Le log va à côté du script (dossier monté, gitignoré), PAS dans la
+    # bibliothèque photo : y écrire pollue le share et casse sur une source en
+    # lecture seule.
+    logger = setup_logging(Path(__file__).resolve().parent, DRY_RUN)
 
     mode_label = "DRY RUN (simulation)" if DRY_RUN else "CONVERSION RÉELLE"
     logger.info("=" * 56)
     logger.info("Mode       : %s", mode_label)
     logger.info("Source     : %s", SOURCE_DIR.resolve())
+    if getattr(config, "_OVERLAY_PATH", None):
+        logger.info("Config     : surcouche active — %s", config._OVERLAY_PATH)
     logger.info("Extensions : %s", ", ".join(sorted(EXTENSIONS)))
     logger.info("Sortie     : même dossier que l'original")
     logger.info(
@@ -544,6 +591,12 @@ def main():
     if not DRY_RUN:
         logger.info("Originaux  : supprimés après conversion réussie")
     logger.info("=" * 56)
+
+    # Un run précédent interrompu (Ctrl-C, bouton « Arrêter » de l'interface web)
+    # a pu laisser des .h265tmp.mkv / .datetmp.mkv à demi écrits. Ils portent
+    # l'extension de la bibliothèque : sans ce nettoyage ils seraient traités
+    # comme de vraies vidéos et finiraient sur Google Photos.
+    _common.purge_temp_artifacts(SOURCE_DIR, DRY_RUN, logger)
 
     # Normalisation des photos (indépendante de ffmpeg) : HEIC -> .jpg puis
     # .jpeg -> .jpg, pour que toute la bibliothèque photo soit en .jpg.
@@ -572,11 +625,15 @@ def main():
         f
         for f in SOURCE_DIR.rglob("*")
         if f.is_file() and f.suffix.lower() in scan_exts
+        # Dossiers de travail « _ » : hors pipeline, comme pour 03/04.
+        and not _common.in_excluded_folder(f, SOURCE_DIR)
+        # Temporaires d'un run concurrent/interrompu : jamais des médias.
+        and not _common.is_temp_artifact(f)
     )
 
     if not candidates:
         logger.info("Aucun fichier trouvé pour les extensions ciblées.")
-        sys.exit(0)
+        return 0
 
     logger.info("%d fichier(s) trouvé(s), analyse des codecs...", len(candidates))
     logger.info("")
@@ -590,7 +647,7 @@ def main():
     skipped = encoded = remuxed = errors = already_h265 = 0
     saved_old = saved_new = 0  # cumul tailles avant/après (bilan « espace »)
     start_total = datetime.now()
-    scan_cache = load_scan_cache(SCAN_CACHE_PATH)
+    scan_cache = _common.load_scan_cache(SCAN_CACHE_PATH, SCAN_CACHE_VERSION)
     prewarm_codecs(candidates, scan_cache)  # pré-sonde // les codecs (cache-miss)
 
     for i, input_file in enumerate(candidates, 1):
@@ -599,7 +656,8 @@ def main():
         src_stat = input_file.stat()
         size = src_stat.st_size
 
-        codec = get_video_codec_cached(input_file, scan_cache)
+        props = get_video_props_cached(input_file, scan_cache)
+        codec = props.get("codec")
         codec_label = codec or "inconnu"
 
         logger.info(
@@ -685,18 +743,33 @@ def main():
 
         t0 = datetime.now()
         if action == "encode":
-            success = encode_h265(input_file, target, creation_iso, logger)
+            success = encode_h265(input_file, target, creation_iso, props, logger)
         else:
             success = remux_to_mkv(input_file, target, creation_iso, logger)
-        elapsed = (datetime.now() - t0).seconds
+        # .total_seconds() et non .seconds : ce dernier repart de 0 au-delà
+        # de 24 h (un très gros encodage afficherait une durée absurde).
+        elapsed = int((datetime.now() - t0).total_seconds())
 
         if success:
             # Garde-fou intégrité : la durée de la sortie doit correspondre à la
             # source. Un remux/ré-encodage peut renvoyer un code 0 tout en
             # produisant une vidéo tronquée (flux corrects mais durée amputée) ;
             # on refuse alors de remplacer/supprimer l'original.
+            # Une durée de sortie ILLISIBLE compte comme un échec : c'est
+            # exactement ce que renvoie ffprobe sur un fichier gravement
+            # tronqué. La version précédente sautait alors le contrôle et
+            # supprimait quand même l'original.
             in_dur = get_duration(input_file)
             out_dur = get_duration(target)
+            if in_dur and out_dur is None:
+                logger.error(
+                    "    ✗ Durée de sortie illisible — sortie probablement "
+                    "tronquée, original conservé"
+                )
+                if target.exists():
+                    target.unlink()
+                errors += 1
+                continue
             if in_dur and out_dur and abs(in_dur - out_dur) > max(1.0, 0.01 * in_dur):
                 logger.error(
                     "    ✗ Durée incohérente (%.0fs → %.0fs) — sortie tronquée, "
@@ -786,8 +859,10 @@ def main():
                 logger.warning("    Fichier partiel supprimé : %s", target.name)
             errors += 1
 
-    elapsed_total = (datetime.now() - start_total).seconds
-    save_scan_cache(SCAN_CACHE_PATH, scan_cache)
+    elapsed_total = int((datetime.now() - start_total).total_seconds())
+    # Purge des entrées dont le fichier a disparu (converti, renommé, supprimé).
+    _common.prune_scan_cache(scan_cache, [k for k in scan_cache if os.path.exists(k)])
+    save_scan_cache(scan_cache)
 
     # ── Bilan final ─────────────────────────────────────────
     logger.info("")
@@ -832,9 +907,13 @@ def main():
             remuxed,
             errors,
         )
-        logger.info("  Log : %s", SOURCE_DIR / "conversion.log")
+        logger.info("  Log : %s", Path(__file__).resolve().parent / "conversion.log")
     logger.info("=" * 56)
+
+    # Code de sortie parlant : sans lui le lanceur (set -e + trap ERR) enchaîne
+    # sur l'étape suivante et notifie « ✅ » même si tout a échoué.
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

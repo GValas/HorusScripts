@@ -1,17 +1,24 @@
 import os
 import subprocess
 import json
-import shutil
-import importlib.util
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _common  # noqa: E402
+
 # Codes couleur ANSI : succès en vert, erreurs en rouge, avertissements en jaune.
-GREEN = "\033[92m"
-RED = "\033[91m"
-YELLOW = "\033[93m"
-RESET = "\033[0m"
+# Uniquement quand stdout est un vrai terminal : sous `docker compose` piloté par
+# l'interface web, la sortie part dans un tube et les séquences d'échappement
+# s'afficheraient telles quelles (« [92m[✓] Done ») dans la console du
+# navigateur. FORCE_COLOR=1 permet de les réactiver explicitement.
+_USE_COLOR = sys.stdout.isatty() or os.environ.get("FORCE_COLOR") == "1"
+GREEN = "\033[92m" if _USE_COLOR else ""
+RED = "\033[91m" if _USE_COLOR else ""
+YELLOW = "\033[93m" if _USE_COLOR else ""
+RESET = "\033[0m" if _USE_COLOR else ""
 
 
 # Fichier log (ouvert dans main) : trace persistante du run, en plus de stdout.
@@ -47,23 +54,16 @@ def log(msg: str = "") -> None:
 
 
 # ── Configuration : tout est dans 00-config.py (COMMUN + CONVERT_*) ───────────
-_spec = importlib.util.spec_from_file_location(
-    "pipeline_config", Path(__file__).with_name("00-config.py")
-)
-config = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(config)
+config = _common.load_config(__file__)
 
 INPUT_FOLDERS = config.INPUT_FOLDERS  # dossiers scannés récursivement
 CQ = config.CONVERT_CQ  # qualité NVENC (+ bas = mieux)
 PRESET = config.CONVERT_PRESET  # préréglage NVENC (p1 → p7)
 EXTENSIONS = config.CONVERT_EXTENSIONS  # conteneurs vidéo scannés
 SKIP_SUFFIX = config.CONVERT_SKIP_SUFFIX  # fichiers déjà convertis (ignorés)
-DRY_RUN = config.DRY_RUN  # True = simulation seule
-# Surcharge CLI : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
+# DRY_RUN effectif : PIPELINE_DRY_RUN (1/0), exporté par le lanceur (--dry-run /
 # --real), prime sur 00-config.py.
-_dr = os.environ.get("PIPELINE_DRY_RUN")
-if _dr is not None:
-    DRY_RUN = _dr == "1"
+DRY_RUN = _common.resolve_dry_run(config)
 # Cache de scan (codec/dimensions par fichier) ; None = désactivé.
 SCAN_CACHE_PATH = (
     Path(__file__).with_name(config.CONVERT_SCAN_CACHE)
@@ -71,6 +71,13 @@ SCAN_CACHE_PATH = (
     else None
 )
 SCAN_WORKERS = getattr(config, "CONVERT_SCAN_WORKERS", 1)  # sondes // au scan
+# Schéma des entrées du cache : à incrémenter dès qu'on stocke un champ de plus,
+# pour invalider proprement les caches écrits par une version antérieure.
+SCAN_CACHE_VERSION = 2
+# Sauvegarde intermédiaire du cache tous les N fichiers sondés : un run de
+# plusieurs heures interrompu (Ctrl-C, bouton « Arrêter » de l'interface web) ne
+# doit pas perdre l'intégralité du travail de scan.
+SCAN_CACHE_FLUSH_EVERY = 200
 
 # Résolution max de sortie -> boîte (largeur, hauteur) à ne pas dépasser.
 # CONVERT_MAX_RESOLUTION (00-config.py) vaut une de ces clés, ou None (pas de
@@ -197,26 +204,9 @@ def get_duration(filepath: Path) -> float | None:
         return None
 
 
-def load_scan_cache(path: Path | None) -> dict:
-    """Charge le cache de scan JSON (clé = chemin) ; {} si absent/désactivé."""
-    if not path:
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
-def save_scan_cache(path: Path | None, cache: dict) -> None:
-    """Écrit le cache de scan (best-effort : une erreur d'écriture est ignorée)."""
-    if not path:
-        return
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-    except OSError:
-        pass
+def save_scan_cache(cache: dict) -> None:
+    """Sauvegarde intermédiaire/finale du cache de scan (best-effort)."""
+    _common.save_scan_cache(SCAN_CACHE_PATH, cache, SCAN_CACHE_VERSION)
 
 
 def probe_for_scan(f: Path, cache: dict) -> tuple:
@@ -233,7 +223,7 @@ def probe_for_scan(f: Path, cache: dict) -> tuple:
 
     key = str(f)
     ent = cache.get(key)
-    if ent and ent.get("mtime") == int(st.st_mtime) and ent.get("size") == st.st_size:
+    if _common.cache_entry_valid(ent, st):
         return ent.get("codec"), ent.get("width"), ent.get("height")
 
     info = get_video_info(f)
@@ -263,12 +253,7 @@ def prewarm_scan(candidates: list, cache: dict) -> None:
             st = f.stat()
         except OSError:
             continue
-        ent = cache.get(str(f))
-        if not (
-            ent
-            and ent.get("mtime") == int(st.st_mtime)
-            and ent.get("size") == st.st_size
-        ):
+        if not _common.cache_entry_valid(cache.get(str(f)), st):
             misses.append((f, st))
     if not misses:
         return
@@ -278,7 +263,7 @@ def prewarm_scan(candidates: list, cache: dict) -> None:
         return str(f), st, get_video_info(f)
 
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
-        for key, st, info in ex.map(work, misses):
+        for i, (key, st, info) in enumerate(ex.map(work, misses), 1):
             cache[key] = {
                 "mtime": int(st.st_mtime),
                 "size": st.st_size,
@@ -286,18 +271,14 @@ def prewarm_scan(candidates: list, cache: dict) -> None:
                 "width": info["width"],
                 "height": info["height"],
             }
+            # Flush périodique : sonder une grosse bibliothèque prend des
+            # dizaines de minutes ; une interruption ne doit pas tout perdre.
+            if i % SCAN_CACHE_FLUSH_EVERY == 0:
+                save_scan_cache(cache)
+    save_scan_cache(cache)
 
 
-def enough_space(target_dir: Path, needed: int) -> bool:
-    """True s'il reste au moins `needed` octets libres sur le volume de target_dir.
-
-    Indéterminé (erreur OS) -> True : on ne bloque pas une conversion par excès
-    de prudence si l'espace libre n'a pas pu être lu.
-    """
-    try:
-        return shutil.disk_usage(target_dir).free >= needed
-    except OSError:
-        return True
+enough_space = _common.enough_space
 
 
 def convert_to_x265(input_path: Path) -> bool:
@@ -443,7 +424,8 @@ def convert_to_x265(input_path: Path) -> bool:
         new_bytes = output_path.stat().st_size
         old_mb = old_bytes / 1024 / 1024
         new_mb = new_bytes / 1024 / 1024
-        saving = 100 - (new_mb / old_mb * 100)
+        # Un fichier source de 0 octet ferait diviser par zéro.
+        saving = 100 - (new_mb / old_mb * 100) if old_bytes else 0.0
 
         log(f"  [✓] Done: {old_mb:.1f}MB → {new_mb:.1f}MB " f"(saved {saving:.1f}%)")
 
@@ -467,14 +449,25 @@ def convert_to_x265(input_path: Path) -> bool:
         # Verify output DURATION matches the source: a correct stream count does
         # not guarantee a complete encode (a truncated output keeps all streams
         # but loses time). Refuse to delete the original when durations diverge.
+        # Une durée de sortie ILLISIBLE doit être traitée comme un échec : c'est
+        # précisément ce que renvoie ffprobe sur un fichier gravement tronqué. La
+        # version précédente (`if in_dur and out_dur and ...`) sautait
+        # silencieusement le contrôle dans ce cas — et supprimait l'original.
         in_dur = get_duration(input_path)
         out_dur = get_duration(output_path)
-        if in_dur and out_dur and abs(in_dur - out_dur) > max(1.0, 0.01 * in_dur):
-            log(
-                f"  [✗] Duration mismatch ({in_dur:.0f}s → {out_dur:.0f}s) — "
-                f"likely truncated, original kept: {output_path.name}"
-            )
-            return False
+        if in_dur:
+            if out_dur is None:
+                log(
+                    f"  [✗] Output duration unreadable — likely truncated, "
+                    f"original kept: {output_path.name}"
+                )
+                return False
+            if abs(in_dur - out_dur) > max(1.0, 0.01 * in_dur):
+                log(
+                    f"  [✗] Duration mismatch ({in_dur:.0f}s → {out_dur:.0f}s) — "
+                    f"likely truncated, original kept: {output_path.name}"
+                )
+                return False
 
         # Success: replace the original with the converted file, keeping its name
         final_path = input_path.with_name(input_path.stem + ".mkv")
@@ -540,6 +533,8 @@ def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
             log(f"  [!] To convert ({reason}): {f.relative_to(root_path)}")
             to_convert.append(f)
 
+    save_scan_cache(cache)  # les sondes faites ici (scan séquentiel) sont acquises
+
     log(f"\n[*] {len(to_convert)} file(s) need conversion\n")
     if not to_convert:
         log("[✓] Nothing to do!")
@@ -564,15 +559,12 @@ def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
     return success, failed
 
 
-def _human_bytes(size: float) -> str:
-    for unit in ("o", "Ko", "Mo", "Go"):
-        if size < 1024:
-            return f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} To"
+_human_bytes = _common.human_size_bytes
 
 
-if __name__ == "__main__":
+def main() -> int:
+    global LOG_FILE_HANDLE
+
     # Fichier log persistant (à côté des scripts, gitignoré), en plus de stdout.
     log_name = "dry_run.log" if DRY_RUN else "conversion.log"
     try:
@@ -584,8 +576,10 @@ if __name__ == "__main__":
 
     if DRY_RUN:
         log("[*] DRY-RUN mode: simulation only, no file will be converted\n")
+    if getattr(config, "_OVERLAY_PATH", None):
+        log(f"[*] Config overlay active: {config._OVERLAY_PATH}")
 
-    scan_cache = load_scan_cache(SCAN_CACHE_PATH)
+    scan_cache = _common.load_scan_cache(SCAN_CACHE_PATH, SCAN_CACHE_VERSION)
 
     total_success, total_failed = 0, 0
     for folder in INPUT_FOLDERS:
@@ -596,7 +590,14 @@ if __name__ == "__main__":
         total_success += s
         total_failed += f
 
-    save_scan_cache(SCAN_CACHE_PATH, scan_cache)
+    # Purge des entrées dont le fichier a disparu (renommé, supprimé, converti) :
+    # sans ça le cache ne rétrécit jamais et grossit indéfiniment.
+    dropped = _common.prune_scan_cache(
+        scan_cache, [k for k in scan_cache if os.path.exists(k)]
+    )
+    if dropped:
+        log(f"[*] Scan cache: {dropped} stale entrie(s) pruned")
+    save_scan_cache(scan_cache)
 
     if len(INPUT_FOLDERS) > 1:
         log("\n" + "═" * 60)
@@ -616,3 +617,11 @@ if __name__ == "__main__":
 
     if LOG_FILE_HANDLE is not None:
         LOG_FILE_HANDLE.close()
+
+    # Code de sortie parlant : sans lui le lanceur (set -e + trap ERR) notifie
+    # « ✅ Pipeline terminé » même quand toutes les conversions ont échoué.
+    return 1 if total_failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

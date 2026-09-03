@@ -8,7 +8,8 @@ Stdlib uniquement (aucune dépendance pip sur l'hôte, comme le reste du repo) :
     sous-processus (les lanceurs restent la SEULE logique métier) ;
   - streame les logs en direct (Server-Sent Events) ;
   - permet d'arrêter un run (SIGINT au groupe -> escalade SIGKILL) ;
-  - lit / réécrit les réglages whitelistés des deux 00-config.py.
+  - lit les réglages whitelistés des deux 00-config.py et écrit les valeurs
+    modifiées dans une SURCOUCHE 00-config.local.py (gitignorée).
 
 Un seul run à la fois (les pipelines pilotent le GPU/Docker en série).
 
@@ -16,11 +17,11 @@ Usage : python3 src/gui/server.py [PORT] [HOST]   (défaut 8765, 0.0.0.0)
         …ou via ./run-gui.sh
 """
 
+import collections
 import http.server
 import importlib.util
 import json
 import os
-import re
 import signal
 import socket
 import subprocess
@@ -50,24 +51,77 @@ PIPELINES = {
             ["04", "upload — output/gphotos → Google Photos (rclone)"],
         ],
         "fields": [
-            {"key": "DRY_RUN", "type": "bool", "label": "Simulation par défaut (DRY_RUN)",
-             "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge."},
-            {"key": "PHOTOS_SRC", "type": "str", "label": "Dossier source (PHOTOS_SRC)",
-             "help": "Racine scannée par 01/02/03 (NAS ou dossier Windows en /mnt/c/…)."},
-            {"key": "VIDEO_CQ", "type": "int", "label": "Qualité NVENC vidéo (VIDEO_CQ)",
-             "help": "Plus bas = meilleure qualité (24–30 conseillé)."},
-            {"key": "VIDEO_PRESET", "type": "choice", "choices": PRESET_CHOICES,
-             "label": "Préréglage NVENC (VIDEO_PRESET)", "help": "p1 (rapide) → p7 (qualité)."},
-            {"key": "CONVERT_SCAN_WORKERS", "type": "int", "label": "Threads scan ffprobe (CONVERT_SCAN_WORKERS)"},
-            {"key": "COMPRESS_MAX_PHOTO_SIZE", "type": "int", "label": "Côté max photo, px (COMPRESS_MAX_PHOTO_SIZE)"},
-            {"key": "COMPRESS_VIDEO_HEIGHT", "type": "int", "label": "Hauteur vidéo compressée, px (COMPRESS_VIDEO_HEIGHT)"},
-            {"key": "COMPRESS_JPEG_QUALITY", "type": "int", "label": "Qualité JPEG (COMPRESS_JPEG_QUALITY)"},
-            {"key": "COMPRESS_PHOTO_WORKERS", "type": "int", "label": "Threads compression photo (COMPRESS_PHOTO_WORKERS)"},
-            {"key": "UPLOAD_TRANSFERS", "type": "int", "label": "Uploads parallèles (UPLOAD_TRANSFERS)"},
-            {"key": "UPLOAD_TPSLIMIT", "type": "int", "label": "Plafond requêtes/s (UPLOAD_TPSLIMIT)"},
-            {"key": "UPLOAD_RETRIES", "type": "int", "label": "Passes rclone (UPLOAD_RETRIES)"},
-            {"key": "NOTIFY_WEBHOOK", "type": "str_or_none", "label": "Webhook de fin de run (NOTIFY_WEBHOOK)",
-             "help": "URL ntfy/webhook, ou vide pour aucune notification."},
+            {
+                "key": "DRY_RUN",
+                "type": "bool",
+                "label": "Simulation par défaut (DRY_RUN)",
+                "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge.",
+            },
+            {
+                "key": "PHOTOS_SRC",
+                "type": "str",
+                "label": "Dossier source (PHOTOS_SRC)",
+                "help": "Racine scannée par 01/02/03 (NAS ou dossier Windows en /mnt/c/…).",
+            },
+            {
+                "key": "VIDEO_CQ",
+                "type": "int",
+                "label": "Qualité NVENC vidéo (VIDEO_CQ)",
+                "help": "Plus bas = meilleure qualité (24–30 conseillé).",
+            },
+            {
+                "key": "VIDEO_PRESET",
+                "type": "choice",
+                "choices": PRESET_CHOICES,
+                "label": "Préréglage NVENC (VIDEO_PRESET)",
+                "help": "p1 (rapide) → p7 (qualité).",
+            },
+            {
+                "key": "CONVERT_SCAN_WORKERS",
+                "type": "int",
+                "label": "Threads scan ffprobe (CONVERT_SCAN_WORKERS)",
+            },
+            {
+                "key": "COMPRESS_MAX_PHOTO_SIZE",
+                "type": "int",
+                "label": "Côté max photo, px (COMPRESS_MAX_PHOTO_SIZE)",
+            },
+            {
+                "key": "COMPRESS_VIDEO_HEIGHT",
+                "type": "int",
+                "label": "Hauteur vidéo compressée, px (COMPRESS_VIDEO_HEIGHT)",
+            },
+            {
+                "key": "COMPRESS_JPEG_QUALITY",
+                "type": "int",
+                "label": "Qualité JPEG (COMPRESS_JPEG_QUALITY)",
+            },
+            {
+                "key": "COMPRESS_PHOTO_WORKERS",
+                "type": "int",
+                "label": "Threads compression photo (COMPRESS_PHOTO_WORKERS)",
+            },
+            {
+                "key": "UPLOAD_TRANSFERS",
+                "type": "int",
+                "label": "Uploads parallèles (UPLOAD_TRANSFERS)",
+            },
+            {
+                "key": "UPLOAD_TPSLIMIT",
+                "type": "int",
+                "label": "Plafond requêtes/s (UPLOAD_TPSLIMIT)",
+            },
+            {
+                "key": "UPLOAD_RETRIES",
+                "type": "int",
+                "label": "Passes rclone (UPLOAD_RETRIES)",
+            },
+            {
+                "key": "NOTIFY_WEBHOOK",
+                "type": "str_or_none",
+                "label": "Webhook de fin de run (NOTIFY_WEBHOOK)",
+                "help": "URL ntfy/webhook, ou vide pour aucune notification.",
+            },
         ],
     },
     "public": {
@@ -76,40 +130,84 @@ PIPELINES = {
         "config": "src/public-media/00-config.py",
         "steps": None,  # 01 puis 02, toujours enchaînés
         "fields": [
-            {"key": "DRY_RUN", "type": "bool", "label": "Simulation par défaut (DRY_RUN)",
-             "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge. "
-                     "02 SUPPRIME les originaux en mode réel."},
-            {"key": "NAS_MOUNT", "type": "str", "label": "Racine NAS (NAS_MOUNT)",
-             "help": "/mnt/wsl/horus (jamais /mnt/horus) — ou un /mnt/c/… Windows."},
-            {"key": "INPUT_FOLDERS", "type": "list", "label": "Dossiers à traiter (INPUT_FOLDERS)",
-             "help": "Un chemin par ligne. Ceux sous NAS_MOUNT sont réécrits en f\"{NAS_MOUNT}/…\"."},
-            {"key": "CONVERT_CQ", "type": "int", "label": "Qualité NVENC (CONVERT_CQ)",
-             "help": "Plus bas = meilleure qualité (24–28 conseillé)."},
-            {"key": "CONVERT_PRESET", "type": "choice", "choices": PRESET_CHOICES,
-             "label": "Préréglage NVENC (CONVERT_PRESET)", "help": "p1 (rapide) → p7 (qualité)."},
-            {"key": "CONVERT_MAX_RESOLUTION", "type": "str_or_none", "label": "Downscale max (CONVERT_MAX_RESOLUTION)",
-             "help": "480p / 720p / 1080p / 1440p / 2160p / 4k, ou vide pour aucun."},
-            {"key": "NOTIFY_WEBHOOK", "type": "str_or_none", "label": "Webhook de fin de run (NOTIFY_WEBHOOK)",
-             "help": "URL ntfy/webhook, ou vide pour aucune notification."},
+            {
+                "key": "DRY_RUN",
+                "type": "bool",
+                "label": "Simulation par défaut (DRY_RUN)",
+                "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge. "
+                "02 SUPPRIME les originaux en mode réel.",
+            },
+            {
+                "key": "NAS_MOUNT",
+                "type": "str",
+                "label": "Racine NAS (NAS_MOUNT)",
+                "help": "/mnt/wsl/horus (jamais /mnt/horus) — ou un /mnt/c/… Windows.",
+            },
+            {
+                "key": "INPUT_FOLDERS",
+                "type": "list",
+                "label": "Dossiers à traiter (INPUT_FOLDERS)",
+                "help": "Un chemin par ligne (chemins absolus).",
+            },
+            {
+                "key": "CONVERT_CQ",
+                "type": "int",
+                "label": "Qualité NVENC (CONVERT_CQ)",
+                "help": "Plus bas = meilleure qualité (24–28 conseillé).",
+            },
+            {
+                "key": "CONVERT_PRESET",
+                "type": "choice",
+                "choices": PRESET_CHOICES,
+                "label": "Préréglage NVENC (CONVERT_PRESET)",
+                "help": "p1 (rapide) → p7 (qualité).",
+            },
+            {
+                "key": "CONVERT_MAX_RESOLUTION",
+                "type": "str_or_none",
+                "label": "Downscale max (CONVERT_MAX_RESOLUTION)",
+                "help": "480p / 720p / 1080p / 1440p / 2160p / 4k, ou vide pour aucun.",
+            },
+            {
+                "key": "NOTIFY_WEBHOOK",
+                "type": "str_or_none",
+                "label": "Webhook de fin de run (NOTIFY_WEBHOOK)",
+                "help": "URL ntfy/webhook, ou vide pour aucune notification.",
+            },
         ],
     },
 }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Lecture / écriture de config (importlib pour lire, regex ciblée pour réécrire
-# en préservant commentaires et mise en forme).
+# Lecture / écriture de config : importlib pour lire (00-config.py + surcouche),
+# génération complète de 00-config.local.py pour écrire.
 # ──────────────────────────────────────────────────────────────────────────────
 def _config_path(pipeline):
     return ROOT / PIPELINES[pipeline]["config"]
 
 
+def _overlay_path(pipeline):
+    """Surcouche locale (gitignorée) où l'interface écrit ses modifications."""
+    return _config_path(pipeline).with_name("00-config.local.py")
+
+
 def load_config(pipeline):
-    """Charge le 00-config.py et renvoie {key: valeur} pour les champs whitelistés."""
+    """Valeurs EFFECTIVES des champs whitelistés : 00-config.py + surcouche.
+
+    Même ordre de chargement que les scripts et les lanceurs (_common.load_config)
+    pour que l'interface affiche exactement ce qui sera exécuté.
+    """
     path = _config_path(pipeline)
     spec = importlib.util.spec_from_file_location("horus_cfg", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    overlay = _overlay_path(pipeline)
+    if overlay.is_file():
+        exec(
+            compile(overlay.read_text(encoding="utf-8"), str(overlay), "exec"),
+            module.__dict__,
+        )
     out = {}
     for field in PIPELINES[pipeline]["fields"]:
         out[field["key"]] = getattr(module, field["key"], None)
@@ -147,46 +245,54 @@ def _literal(field, value):
         return json.dumps(value, ensure_ascii=False)
     if t == "str_or_none":
         return "None" if value is None else json.dumps(value, ensure_ascii=False)
+    if t == "list":
+        if not value:
+            return "[]"
+        items = "\n".join(f"    {json.dumps(v, ensure_ascii=False)}," for v in value)
+        return "[\n" + items + "\n]"
     raise ValueError(f"littéral non géré: {t}")
 
 
-def rewrite_config(pipeline, payload):
-    """Réécrit en place les clés fournies dans le 00-config.py (validé, atomique)."""
+OVERLAY_HEADER = """\
+# 00-config.local.py — SURCOUCHE LOCALE, ENTIÈREMENT GÉNÉRÉE.
+#
+# Écrit par l'interface web (src/gui). Chargé APRÈS 00-config.py par les scripts
+# et les lanceurs : les valeurs ci-dessous ÉCRASENT celles du fichier versionné.
+# Gitignoré — c'est ici que vivent les réglages volatils (dossier en cours de
+# traitement, DRY_RUN du moment), pour que 00-config.py ne bouge plus à chaque
+# lancement et reste lisible dans git.
+#
+# Toute modification manuelle sera écrasée au prochain enregistrement depuis
+# l'interface. Supprimer ce fichier suffit à revenir aux valeurs de 00-config.py.
+"""
+
+
+def write_overlay(pipeline, payload):
+    """Écrit la surcouche 00-config.local.py à partir des champs whitelistés.
+
+    On n'édite plus 00-config.py : le réécrire à chaque lancement produisait du
+    bruit permanent dans git, et la réécriture par expression régulière abîmait
+    les valeurs contenant un « # » (pris pour un début de commentaire).
+    """
     fields = {f["key"]: f for f in PIPELINES[pipeline]["fields"]}
-    path = _config_path(pipeline)
-    text = path.read_text(encoding="utf-8")
-    # NAS_MOUNT courant (pour réécrire INPUT_FOLDERS en f-strings) : valeur reçue
-    # si présente, sinon valeur actuelle du fichier.
-    _, current = load_config(pipeline)
-    nas_mount = current.get("NAS_MOUNT")
-    if "NAS_MOUNT" in payload:
-        nas_mount = coerce(fields["NAS_MOUNT"], payload["NAS_MOUNT"])
-
-    for key, raw in payload.items():
-        field = fields.get(key)
-        if field is None:
+    for key in payload:
+        if key not in fields:
             raise ValueError(f"clé non éditable: {key}")
-        value = coerce(field, raw)
 
-        if field["type"] == "list":
-            lines = []
-            for item in value:
-                base = (nas_mount or "").rstrip("/")
-                if base and item.startswith(base + "/"):
-                    rest = item[len(base) + 1:]
-                    lines.append(f'    f"{{NAS_MOUNT}}/{rest}",')
-                else:
-                    lines.append(f"    {json.dumps(item, ensure_ascii=False)},")
-            block = key + " = [\n" + "\n".join(lines) + "\n]"
-            pattern = re.compile(rf"^{key}\s*=\s*\[.*?\]", re.MULTILINE | re.DOTALL)
-            text, n = pattern.subn(lambda m: block, text, count=1)
-        else:
-            literal = _literal(field, value)
-            pattern = re.compile(rf"^(\s*{key}\s*=\s*)(.*?)(\s*#.*)?$", re.MULTILINE)
-            text, n = pattern.subn(lambda m: m.group(1) + literal + (m.group(3) or ""), text, count=1)
-        if n == 0:
-            raise ValueError(f"clé introuvable dans le fichier: {key}")
+    # On repart des valeurs effectives courantes pour que la surcouche reste
+    # complète même si le formulaire n'envoie qu'une partie des champs.
+    _, current = load_config(pipeline)
+    values = dict(current)
+    for key, raw in payload.items():
+        values[key] = coerce(fields[key], raw)
 
+    lines = [OVERLAY_HEADER]
+    for field in PIPELINES[pipeline]["fields"]:
+        key = field["key"]
+        lines.append(f"{key} = {_literal(field, values.get(key))}")
+    text = "\n".join(lines) + "\n"
+
+    path = _overlay_path(pipeline)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
@@ -195,10 +301,20 @@ def rewrite_config(pipeline, payload):
 # ──────────────────────────────────────────────────────────────────────────────
 # Gestion d'un (seul) run : sous-processus + buffer de logs + notifications SSE.
 # ──────────────────────────────────────────────────────────────────────────────
+# Nombre maximal de lignes de log conservées en mémoire. Un run de plusieurs
+# heures (ffmpeg -stats) en produit des centaines de milliers : sans borne, la
+# RAM du serveur croît indéfiniment et chaque nouveau client SSE rejoue tout.
+MAX_LOG_LINES = 5000
+
+
 class RunManager:
     def __init__(self):
         self.cond = threading.Condition()
-        self.lines = []
+        # deque bornée : les lignes les plus anciennes sont abandonnées.
+        # `total` compte TOUTES les lignes émises depuis le début du run, ce qui
+        # donne aux clients SSE un curseur absolu stable malgré la troncature.
+        self.lines = collections.deque(maxlen=MAX_LOG_LINES)
+        self.total = 0
         self.proc = None
         self.running = False
         self.meta = {}
@@ -208,7 +324,7 @@ class RunManager:
             return {
                 "running": self.running,
                 "meta": dict(self.meta),
-                "lines": len(self.lines),
+                "lines": self.total,
             }
 
     def start(self, pipeline, mode, steps):
@@ -224,7 +340,8 @@ class RunManager:
             if PIPELINES[pipeline]["steps"] is not None and steps:
                 valid = {s[0] for s in PIPELINES[pipeline]["steps"]}
                 cmd += [s for s in steps if s in valid]
-            self.lines = []
+            self.lines.clear()
+            self.total = 0
             self.meta = {
                 "pipeline": pipeline,
                 "mode": mode,
@@ -251,8 +368,13 @@ class RunManager:
 
     def _append(self, line):
         with self.cond:
-            self.lines.append(line)
+            self._append_locked(line)
             self.cond.notify_all()
+
+    def _append_locked(self, line):
+        """Ajoute une ligne (verrou déjà tenu) en gardant `total` cohérent."""
+        self.lines.append(line)
+        self.total += 1
 
     def _pump(self):
         try:
@@ -263,7 +385,7 @@ class RunManager:
             with self.cond:
                 self.running = False
                 self.meta["exit_code"] = code
-                self.lines.append(f"=== Terminé (code de sortie {code}) ===")
+                self._append_locked(f"=== Terminé (code de sortie {code}) ===")
                 self.cond.notify_all()
 
     def stop(self):
@@ -333,7 +455,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json({"error": "pipeline inconnu"}, 404)
             try:
                 _, values = load_config(pipeline)
-                return self._send_json({"values": values})
+                overlay = _overlay_path(pipeline)
+                return self._send_json(
+                    {
+                        "values": values,
+                        "overlay": str(overlay) if overlay.is_file() else None,
+                    }
+                )
             except Exception as exc:  # noqa: BLE001
                 return self._send_json({"error": str(exc)}, 500)
         if path == "/api/stream":
@@ -345,7 +473,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/api/run":
                 body = self._read_body()
-                meta = MANAGER.start(body.get("pipeline"), body.get("mode"), body.get("steps"))
+                meta = MANAGER.start(
+                    body.get("pipeline"), body.get("mode"), body.get("steps")
+                )
                 return self._send_json({"ok": True, "meta": meta})
             if path == "/api/stop":
                 return self._send_json({"ok": MANAGER.stop()})
@@ -353,9 +483,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pipeline = path.rsplit("/", 1)[-1]
                 if pipeline not in PIPELINES:
                     return self._send_json({"error": "pipeline inconnu"}, 404)
-                rewrite_config(pipeline, self._read_body())
+                write_overlay(pipeline, self._read_body())
                 _, values = load_config(pipeline)
-                return self._send_json({"ok": True, "values": values})
+                return self._send_json(
+                    {
+                        "ok": True,
+                        "values": values,
+                        "overlay": str(_overlay_path(pipeline)),
+                    }
+                )
         except RuntimeError as exc:  # run déjà en cours
             return self._send_json({"error": str(exc)}, 409)
         except Exception as exc:  # noqa: BLE001
@@ -395,10 +531,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             while True:
                 with MANAGER.cond:
-                    while cursor >= len(MANAGER.lines) and MANAGER.running:
+                    while cursor >= MANAGER.total and MANAGER.running:
                         MANAGER.cond.wait(timeout=15)
-                    new = MANAGER.lines[cursor:]
-                    cursor = len(MANAGER.lines)
+                    # Index absolu de la plus ancienne ligne encore en mémoire.
+                    first = MANAGER.total - len(MANAGER.lines)
+                    if cursor < first:
+                        dropped = first - cursor
+                        new = [
+                            f"… {dropped} ligne(s) plus anciennes tronquées …",
+                            *MANAGER.lines,
+                        ]
+                    else:
+                        new = list(MANAGER.lines)[cursor - first :]
+                    cursor = MANAGER.total
                     running = MANAGER.running
                 if new:
                     for line in new:
@@ -407,7 +552,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.wfile.write(b": keepalive\n\n")
                 self.wfile.flush()
-                if not running and cursor >= len(MANAGER.lines):
+                if not running and cursor >= MANAGER.total:
                     end = json.dumps(MANAGER.status(), ensure_ascii=False)
                     self.wfile.write(f"event: end\ndata: {end}\n\n".encode("utf-8"))
                     self.wfile.flush()

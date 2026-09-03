@@ -12,9 +12,15 @@ env/rclone.conf
 src/archives/
 rapport.csv
 
+# Surcouche de config écrite par l'interface web — locale à la machine, jamais
+# versionnée (c'est tout l'intérêt : 00-config.py ne bouge plus à chaque run).
+00-config.local.py
+**/00-config.local.py
+
 # Cache de scan ffprobe (codec/dimensions par fichier) — généré, non versionné
 .scan-cache.json
 **/.scan-cache.json
+*.tmp
 
 # Fichiers log de conversion — générés, non versionnés
 conversion.log

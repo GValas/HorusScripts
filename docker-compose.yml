@@ -25,6 +25,12 @@ services:
       # la config prend effet sans rebuild.
       - ./src/public-media:/work
     working_dir: /work
+    # Même politique que le pipeline perso (`docker run --user`) : les fichiers
+    # générés dans le volume monté (conversion.log, .scan-cache.json) doivent
+    # appartenir à l'utilisateur de l'hôte, pas à root. HOST_UID/HOST_GID sont
+    # exportés par run-public-media-pipeline.sh ; la valeur par défaut évite un
+    # échec d'interpolation si on lance `docker compose up` à la main.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     environment:
       # Surcharge éventuelle du DRY_RUN par le lanceur (--dry-run/--real). Si la
       # variable n'est pas définie côté hôte, les scripts retombent sur la valeur

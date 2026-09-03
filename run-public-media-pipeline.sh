@@ -19,11 +19,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CONFIG="src/public-media/00-config.py"
-read_cfg() {
-  python3 -c "import importlib.util,pathlib; \
-s=importlib.util.spec_from_file_location('c', pathlib.Path('${CONFIG}')); \
-m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(getattr(m, '$1'))"
-}
+# Lecture déléguée à src/public-media/_common.py : même chargement que les
+# scripts (00-config.py PUIS la surcouche 00-config.local.py écrite par
+# l'interface web), donc aucune divergence possible entre l'affiché et l'exécuté.
+read_cfg() { python3 src/public-media/_common.py "$1"; }
 
 # docker-compose.yml monte ${NAS_MOUNT}:${NAS_MOUNT} -> il faut l'exporter pour
 # que compose l'interpole (la source de vérité est 00-config.py).
@@ -52,6 +51,13 @@ case "$DRY_OVERRIDE" in
 esac
 export PIPELINE_DRY_RUN=$([ "$DRY_RUN" = "True" ] && echo 1 || echo 0)
 
+# UID/GID de l'hôte : docker-compose.yml lance le conteneur avec, comme le
+# pipeline perso. Sans ça les fichiers générés dans src/public-media
+# (conversion.log, .scan-cache.json) appartiennent à root et ne sont plus
+# éditables ni supprimables sans sudo.
+export HOST_UID="$(id -u)"
+export HOST_GID="$(id -g)"
+
 echo "════════════════════════════════════════════════════════════"
 echo " Pipeline public-media (clean-names -> convert-h265)"
 echo "   NAS    : $NAS_MOUNT"
@@ -66,7 +72,7 @@ fi
 
 # Notification de fin (no-op si NOTIFY_WEBHOOK=None). Sur erreur, le trap envoie
 # l'échec avant de quitter (set -e).
-notify() { python3 "src/public-media/notify.py" "$1" >/dev/null 2>&1 || true; }
+notify() { python3 src/notify.py "$CONFIG" "$1" >/dev/null 2>&1 || true; }
 MODE_LABEL="$([ "$DRY_RUN" = "True" ] && echo DRY-RUN || echo RÉEL)"
 trap 'notify "❌ Pipeline public-media ÉCHEC (mode ${MODE_LABEL})"' ERR
 
