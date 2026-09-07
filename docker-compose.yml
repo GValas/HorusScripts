@@ -36,8 +36,11 @@ services:
       # variable n'est pas définie côté hôte, les scripts retombent sur la valeur
       # de 00-config.py. Forme « clé sans valeur » = transmission de l'env hôte.
       - PIPELINE_DRY_RUN
-    # On nettoie d'abord les noms (renommage), puis on convertit en HEVC.
-    # Les deux scripts partagent INPUT_FOLDERS / DRY_RUN (via 00-config.py).
+    # Commande PAR DÉFAUT (`docker compose up`) : nettoyage des noms puis
+    # conversion HEVC. run-public-media-pipeline.sh, lui, passe par
+    # `docker compose run` et FOURNIT sa propre commande, car les étapes sont
+    # sélectionnables (01 / 02 / 03-identify-movies) — impossible à figer ici.
+    # Tous les scripts partagent INPUT_FOLDERS / DRY_RUN (via 00-config.py).
     command: ["sh", "-c", "python3 01-clean-names.py && python3 02-convert-to-h265.py"]
     # Tâche ponctuelle, pas un service permanent
     restart: "no"

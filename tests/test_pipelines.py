@@ -6,6 +6,10 @@ ont produit des bugs silencieux :
 
   - le nettoyage de noms (suffixe de langue des sous-titres, nom vide,
     fichiers annexes à ne pas toucher) ;
+  - l'identification des films (motif de renommage, empreinte OpenSubtitles,
+    titre/année déduits du nom, sous-titres voisins) ;
+  - le déclenchement d'un ré-encodage par le débit (un seuil mal calculé
+    supprimerait des originaux pour rien) ;
   - le parsing de dates et les fuseaux (une heure UTC prise pour de l'heure
     locale décale les vidéos de 1 à 2 h dans Google Photos) ;
   - les dates déduites du nom de fichier et du dossier parent ;
@@ -54,6 +58,8 @@ PUBLIC = ROOT / "src" / "public-media"
 common_perso = load_module(PERSO / "_common.py", "common_perso")
 common_public = load_module(PUBLIC / "_common.py", "common_public")
 clean = load_module(PUBLIC / "01-clean-names.py", "clean_names")
+identify = load_module(PUBLIC / "03-identify-movies.py", "identify_movies")
+convert = load_module(PUBLIC / "02-convert-to-h265.py", "convert_h265")
 
 
 def _load_enrich():
@@ -132,6 +138,51 @@ class TestCleanNames(unittest.TestCase):
             ["/m/a.1080p.mkv", "/m/a.720p.mkv"], ["/m/A.mkv", "/m/A.mkv"], logger
         )
         self.assertEqual(n, 1)
+
+
+class TestBitrate(unittest.TestCase):
+    """Seuil de débit de 02 : il décide de ré-encoder, donc de supprimer un
+    original. Une mesure impossible ne doit JAMAIS déclencher la conversion."""
+
+    GO = 1024**3
+
+    def test_debit_calcule(self):
+        # 24,5 Go sur 2 h -> ~29 Mb/s (le cas réel qui a motivé le réglage).
+        rate = convert.bitrate_mbps(int(24.5 * self.GO), 7200)
+        self.assertAlmostEqual(rate, 29.2, delta=0.3)
+
+    def test_seuil(self):
+        deux_h = 7200
+        self.assertTrue(convert.exceeds_bitrate(9 * self.GO, deux_h, 8))
+        self.assertFalse(convert.exceeds_bitrate(2 * self.GO, deux_h, 8))
+
+    def test_mesure_impossible_ne_declenche_rien(self):
+        """Durée illisible ou taille nulle : on ne ré-encode pas à l'aveugle."""
+        self.assertFalse(convert.exceeds_bitrate(9 * self.GO, None, 8))
+        self.assertFalse(convert.exceeds_bitrate(9 * self.GO, 0, 8))
+        self.assertFalse(convert.exceeds_bitrate(0, 7200, 8))
+        self.assertIsNone(convert.bitrate_mbps(9 * self.GO, None))
+
+    def test_seuil_absent_desactive_le_controle(self):
+        self.assertFalse(convert.exceeds_bitrate(99 * self.GO, 60, None))
+        self.assertFalse(convert.exceeds_bitrate(99 * self.GO, 60, 0))
+
+
+class TestScanCacheEntry(unittest.TestCase):
+    """Le cache de scan est écrit par deux chemins (séquentiel et parallèle) ;
+    une divergence entre eux a déjà rendu le contrôle de débit inopérant."""
+
+    def test_entree_complete_et_valide(self):
+        st = types.SimpleNamespace(st_mtime=1700000000.7, st_size=12345)
+        info = {"codec": "hevc", "width": 3840, "height": 2160, "duration": 7200.0}
+        entry = convert.scan_cache_entry(st, info)
+        # Tous les champs que probe_for_scan relit ensuite.
+        self.assertEqual(
+            set(entry), {"mtime", "size", "codec", "width", "height", "duration"}
+        )
+        self.assertEqual(entry["duration"], 7200.0)
+        # …et l'entrée doit être reconnue valide pour ce même fichier.
+        self.assertTrue(common_public.cache_entry_valid(entry, st))
 
 
 class TestDates(unittest.TestCase):
@@ -324,6 +375,231 @@ class TestConfigOverlay(unittest.TestCase):
                     os.environ["PIPELINE_DRY_RUN"] = previous
 
 
+class TestIdentifyMovies(unittest.TestCase):
+    """Étape 03 : motif de renommage, empreinte, repli par titre."""
+
+    PATTERN = "{titre}.({yyyy}).{ext}"
+    JOKER = {
+        "annee": "2019",
+        "titre": "Joker",
+        "titre_vo": "Joker",
+        "ext": "mkv",
+    }
+
+    def test_motif_par_defaut(self):
+        name, missing = identify.build_new_name(self.PATTERN, self.JOKER)
+        self.assertEqual(name, "Joker.(2019).mkv")
+        self.assertEqual(missing, [])
+
+    def test_alias_du_motif(self):
+        """{année}, {yyyy} et {extension} désignent les mêmes champs."""
+        name, _ = identify.build_new_name("{année}.{titre}.{extension}", self.JOKER)
+        self.assertEqual(name, "2019.Joker.mkv")
+        name, _ = identify.build_new_name("({yyyy}).{titre_vo}.{ext}", self.JOKER)
+        self.assertEqual(name, "(2019).Joker.mkv")
+
+    def test_champ_manquant_signale(self):
+        """Un titre introuvable ne doit PAS produire « (2019).mkv »."""
+        values = {**self.JOKER, "titre": ""}
+        name, missing = identify.build_new_name(self.PATTERN, values)
+        self.assertEqual(missing, ["titre"])
+        self.assertEqual(name, "(2019).mkv")  # jamais appliqué (missing)
+
+    def test_motif_invalide_refuse(self):
+        with self.assertRaises(SystemExit):
+            identify.validate_pattern("{annee}.{titre}")  # pas d'extension
+        with self.assertRaises(SystemExit):
+            identify.validate_pattern("{annee}.{acteur}.{ext}")  # champ inconnu
+        with self.assertRaises(SystemExit):
+            # {realisateur} a été retiré : un motif qui l'utilise doit échouer
+            # au démarrage, pas produire des noms amputés.
+            identify.validate_pattern("{titre}.{realisateur}.{ext}")
+
+    def test_caracteres_interdits_retires(self):
+        self.assertEqual(
+            identify.sanitize_component("Mission: Impossible - Fallout"),
+            "Mission.Impossible.Fallout",
+        )
+        self.assertNotIn("/", identify.sanitize_component("Face/Off"))
+
+    def test_espaces_conserves_si_pas_de_remplacement(self):
+        self.assertEqual(
+            identify.sanitize_component("Le Grand Bleu", space=""), "Le Grand Bleu"
+        )
+
+    def test_annee_entre_parentheses_prioritaire(self):
+        """« Blade.Runner.2049.(2017) » ne doit pas être daté de 2049."""
+        self.assertEqual(
+            identify.parse_title_year("Blade.Runner.2049.(2017)"),
+            ("Blade Runner 2049", 2017),
+        )
+        self.assertEqual(identify.parse_title_year("Le.Roi.Lion.2019"),
+                         ("Le Roi Lion", 2019))
+
+    def test_empreinte_opensubtitles(self):
+        """Fichier de zéros : l'empreinte vaut exactement la taille du fichier."""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "film.mkv"
+            path.write_bytes(b"\x00" * 200000)
+            self.assertEqual(identify.opensubtitles_hash(path), f"{200000:016x}")
+            # Trop petit (< 128 Kio) : pas d'empreinte possible.
+            path.write_bytes(b"\x00" * 100)
+            self.assertIsNone(identify.opensubtitles_hash(path))
+
+    def test_sous_titres_voisins(self):
+        with TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            video = d / "Joker.(2019).mkv"
+            for name in (
+                "Joker.(2019).mkv",
+                "Joker.(2019).fr.srt",
+                "Joker.(2019).en.forced.srt",
+                "Joker.(2019).jpg",  # jaquette : pas un sous-titre
+                "Autre.Film.fr.srt",  # autre film : ne suit pas
+            ):
+                (d / name).write_text("", encoding="utf-8")
+            found = {p.name: suffix for p, suffix in identify.companion_files(video)}
+            self.assertEqual(
+                found,
+                {
+                    "Joker.(2019).fr.srt": ".fr",
+                    "Joker.(2019).en.forced.srt": ".en.forced",
+                },
+            )
+            self.assertNotIn(video.name, found)
+
+    def test_resultat_invraisemblable_ecarte(self):
+        """Le repli par titre renvoie TOUJOURS un film : on vérifie qu'il colle."""
+        joker = {"titre": "Joker", "titre_vo": "Joker", "annee": "2019"}
+        self.assertTrue(identify.match_is_plausible("Joker.(2019)", joker))
+        # Titre localisé différent du nom de fichier : le titre ORIGINAL sauve.
+        parrain = {"titre": "Le Parrain", "titre_vo": "The Godfather", "annee": "1972"}
+        self.assertTrue(identify.match_is_plausible("The.Godfather.(1972)", parrain))
+        # Déjà renommé par un run précédent : toujours reconnu, donc inchangé.
+        self.assertTrue(identify.match_is_plausible("Joker.(2019)", joker))
+        # Titre distribué sous un autre nom : aucun mot commun, mais l'année
+        # trouvée est celle du fichier -> la recherche était filtrée dessus.
+        poupees = {
+            "titre": "Les Poupées russes",
+            "titre_vo": "Les Poupées russes",
+            "annee": "2005",
+        }
+        self.assertTrue(identify.match_is_plausible("Russian.Dolls.(2005)", poupees))
+        # Film sans rapport : refusé plutôt que renommé n'importe comment.
+        avatar = {"titre": "Avatar", "titre_vo": "Avatar", "annee": "2009"}
+        self.assertFalse(identify.match_is_plausible("Joker.(2019)", avatar))
+        # Sans année dans le nom, seul le recoupement de mots protège.
+        eau = {
+            "titre": "Avatar : La Voie de l'eau",
+            "titre_vo": "Avatar: The Way of Water",
+            "annee": "2022",
+        }
+        self.assertFalse(identify.match_is_plausible("The.Way", eau))
+
+    def test_nom_annee_en_tete(self):
+        """Convention déjà en place sur le NAS : « (1989).Batman.mkv »."""
+        self.assertEqual(
+            identify.parse_title_year("(2008).Batman.The.Dark.Knight"),
+            ("Batman The Dark Knight", 2008),
+        )
+
+    def test_meilleur_resultat_et_non_le_premier(self):
+        """TMDB classe d'abord un documentaire sur « Batman The Dark Knight »."""
+        results = [
+            {
+                "id": 1,
+                "title": "Batman Unmasked: The Psychology of The Dark Knight",
+                "original_title": "Batman Unmasked: The Psychology of "
+                "The Dark Knight",
+                "release_date": "2008-07-15",
+                "popularity": 9,
+            },
+            {
+                "id": 2,
+                "title": "The Dark Knight : Le Chevalier noir",
+                "original_title": "The Dark Knight",
+                "release_date": "2008-07-16",
+                "popularity": 120,
+            },
+        ]
+        best = identify.best_result(results, "(2008).Batman.The.Dark.Knight", 2008)
+        self.assertEqual(best["id"], 2)
+        self.assertIsNone(identify.best_result([], "peu importe", None))
+
+    def test_suite_non_confondue_avec_l_original(self):
+        """« Men in Black III » recouvre tous les mots de « Men.In.Black.1 »."""
+        mib3 = {"titre": "Men in Black III", "titre_vo": "Men in Black 3",
+                "annee": "2012"}
+        self.assertFalse(identify.match_is_plausible("Men.In.Black.1", mib3))
+        mib1 = {"titre": "Men in Black", "titre_vo": "Men in Black",
+                "annee": "1997"}
+        self.assertTrue(identify.match_is_plausible("Men.In.Black.1", mib1))
+        # L'inverse est toléré : la bibliothèque numérote des titres que TMDB
+        # ne numérote pas.
+        reloaded = {"titre": "Matrix Reloaded", "titre_vo": "The Matrix Reloaded",
+                    "annee": "2003"}
+        self.assertTrue(
+            identify.match_is_plausible("Matrix.2.Reloaded.(2003)", reloaded)
+        )
+
+    def test_requete_nettoyee(self):
+        """Les jetons parasites survivants de 01 ruinent la recherche TMDB."""
+        # Le chiffre est CONSERVÉ dans la requête principale (il distingue les
+        # épisodes) et n'est retiré que dans la variante de repli.
+        variants, _ = identify.query_variants("Men.In.Black.1.Remastered")
+        self.assertEqual(variants, ["Men In Black 1", "Men In Black"])
+        variants, year = identify.query_variants("Ducobu.L.Eleve.(2011).Vof")
+        self.assertEqual((variants, year), (["Ducobu L Eleve"], 2011))
+        # Numérotation interne d'une saga : retirée (le titre TMDB ne l'a pas).
+        variants, _ = identify.query_variants("Harry.Potter.1.And.The.Chamber")
+        self.assertEqual(
+            variants, ["Harry Potter 1 And The Chamber", "Harry Potter And The Chamber"]
+        )
+        # …mais un chiffre FINAL fait partie du titre.
+        variants, _ = identify.query_variants("(2004).Spider.Man.2")
+        self.assertEqual(variants, ["Spider Man 2"])
+        # Nom entièrement parasite : aucune requête (plutôt qu'une au hasard).
+        self.assertEqual(identify.query_variants("1080p"), ([], None))
+
+    def test_variante_apres_annee(self):
+        """« Coen.(2000).O.Brother » : le vrai titre suit l'année."""
+        variants, year = identify.query_variants("Coen.(2000).O.Brother")
+        self.assertEqual((variants, year), (["Coen O Brother", "O Brother"], 2000))
+        # Variante spéculative : acceptée seulement si l'année correspond.
+        brother = {"titre": "O'Brother", "titre_vo": "O Brother, Where Art Thou?",
+                   "annee": "2000"}
+        self.assertTrue(
+            identify.match_is_plausible("Coen.(2000).O.Brother", brother, strict=True)
+        )
+        mhd = {"titre": "MHD Dro", "titre_vo": "MHD Dro", "annee": "2020"}
+        self.assertFalse(
+            identify.match_is_plausible("Jurassic.Park.(1993).Mhd", mhd, strict=True)
+        )
+
+    def test_difference_de_casse_seule(self):
+        """Le partage SMB ignore ces renommages en signalant un succès."""
+        self.assertTrue(
+            identify.differs_only_by_case(
+                "(2022).Thor.Love.And.Thunder.mkv", "(2022).Thor.Love.and.Thunder.mkv"
+            )
+        )
+        self.assertFalse(identify.differs_only_by_case("Joker.mkv", "Joker.mkv"))
+        self.assertFalse(identify.differs_only_by_case("Joker.mkv", "Batman.mkv"))
+
+    def test_cache_echec_perime(self):
+        vieux = (datetime.now() - identify.MISS_TTL * 2).isoformat(timespec="seconds")
+        recent = datetime.now().isoformat(timespec="seconds")
+        cache = {
+            "a": {"found": True, "titre": "Joker"},
+            "b": {"found": False, "when": vieux},
+            "c": {"found": False, "when": recent},
+        }
+        self.assertIsNotNone(identify.cache_get(cache, "a"))
+        self.assertIsNone(identify.cache_get(cache, "b"))  # à re-interroger
+        self.assertIsNotNone(identify.cache_get(cache, "c"))
+        self.assertIsNone(identify.cache_get(cache, "inconnu"))
+
+
 class TestGuiConfigWriter(unittest.TestCase):
     """Écriture de la surcouche par l'interface web."""
 
@@ -369,6 +645,21 @@ class TestGuiConfigWriter(unittest.TestCase):
         self.assertEqual(c({"type": "int"}, "26"), 26)
         self.assertIsNone(c({"type": "str_or_none"}, "  "))
         self.assertEqual(c({"type": "list"}, "/a\n\n  /b  \n"), ["/a", "/b"])
+        self.assertEqual(c({"type": "float"}, "0.5"), 0.5)
+
+    def test_etape_optionnelle_decochee(self):
+        """L'étape 03 (identification en ligne) ne doit pas être cochée par
+        défaut : elle appelle des API externes et renomme toute la logithèque."""
+        steps = dict(
+            (s[0], s[2] if len(s) > 2 else True)
+            for s in self.server.PIPELINES["public"]["steps"]
+        )
+        self.assertEqual(steps, {"01": True, "02": True, "03": False})
+
+    def test_champs_identify_editables(self):
+        keys = {f["key"] for f in self.server.PIPELINES["public"]["fields"]}
+        self.assertIn("IDENTIFY_PATTERN", keys)
+        self.assertIn("IDENTIFY_TMDB_API_KEY", keys)
 
 
 if __name__ == "__main__":

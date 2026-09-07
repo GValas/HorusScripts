@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A personal toolkit for managing a home NAS named **horus** (SMB/CIFS share holding media: `movies`, `tvshows`, `cartoons`, `photos`, `perso`). Python 3.12. The repo is organized as **two independent pipelines** under `src/`, plus a scratch/archive folder:
 
-- **`src/public-media/`** — clean movie/TV filenames and re-encode to HEVC. Config-file-driven (`00-config.py`), run via **docker-compose**.
+- **`src/public-media/`** — clean movie/TV filenames, re-encode to HEVC, and (optionally) identify movies against online databases. Config-file-driven (`00-config.py`), run via **docker-compose**.
 - **`src/perso-media/`** — a 4-step personal photo/video pipeline (normalize → date → compress → upload to Google Photos). Config-file-driven, run via the **`run-perso-media-pipeline.sh`** orchestrator.
 - **`src/archives/`** — gitignored scratch: the old Python uploader (`04-…py.bak`), one-off audit scripts, and generated CSV reports. Not part of any pipeline; nothing imports it.
 
@@ -44,19 +44,26 @@ Everything runs in Linux/containers and targets the NAS at **`/mnt/wsl/horus`**.
 
 ## The public pipeline (`src/public-media/`)
 
-Two stdlib-only scripts (ffmpeg/ffprobe binaries aside), **all configured from one file**, [00-config.py](src/public-media/00-config.py) — same principle as the perso pipeline, no env vars. It holds a COMMON section (`NAS_MOUNT`, `INPUT_FOLDERS`, single `DRY_RUN`) plus a per-script section (`CLEAN_*` for 01, `CONVERT_*` for 02). Both scripts load it through `_common.load_config()` — `importlib` under the hood (the `00-config.py` filename has digits/`-`, so it isn't importable directly), plus the `00-config.local.py` overlay.
+Three stdlib-only scripts (ffmpeg/ffprobe binaries aside), **all configured from one file**, [00-config.py](src/public-media/00-config.py) — same principle as the perso pipeline, no env vars. It holds a COMMON section (`NAS_MOUNT`, `INPUT_FOLDERS`, single `DRY_RUN`) plus a per-script section (`CLEAN_*` for 01, `CONVERT_*` for 02, `IDENTIFY_*` for 03). All scripts load it through `_common.load_config()` — `importlib` under the hood (the `00-config.py` filename has digits/`-`, so it isn't importable directly), plus the `00-config.local.py` overlay.
 
 - [01-clean-names.py](src/public-media/01-clean-names.py) — rename movies/shows: strip technical tokens (codecs, resolutions, release groups) and apply naming conventions. Detects **collisions** (two names mapping to the same target) before applying. Only **video and subtitle** extensions are renamed (`CLEAN_VIDEO_EXTENSIONS` / `CLEAN_SUBTITLE_EXTENSIONS`) — artwork and `.nfo` are left alone — and a subtitle's **language suffix is re-attached** after the technical cut (`CLEAN_SUBTITLE_LANG_TOKENS`), otherwise `…fr.srt` and `…en.srt` collapse onto the same target and one track is lost. A name made entirely of technical tokens is left untouched rather than becoming an empty (hidden) filename.
-- [02-convert-to-h265.py](src/public-media/02-convert-to-h265.py) — re-encode to HEVC via NVENC, with colorized timestamped logging and stream-count verification.
+- [02-convert-to-h265.py](src/public-media/02-convert-to-h265.py) — re-encode to HEVC via NVENC, with colorized timestamped logging and stream-count verification. Three independent triggers: a non-HEVC codec, `CONVERT_MAX_RESOLUTION` (downscale, re-encodes even already-HEVC files), and `CONVERT_MAX_BITRATE` in Mb/s — the only knob that targets *size* rather than definition, since a 1080p film can weigh 24 GB purely from its bitrate. When bitrate is the **only** reason (already HEVC, within the resolution limit), the original is kept unless the output is actually smaller — otherwise the picture is degraded for nothing. An unmeasurable bitrate (no duration) never triggers a re-encode: that decision deletes an original. The scan cache stores the duration alongside codec/dimensions (`SCAN_CACHE_VERSION` 3), probed in the same `ffprobe` call via `-show_format`.
+- [03-identify-movies.py](src/public-media/03-identify-movies.py) — **optional, opt-in step**: identify each movie online and rename it after `IDENTIFY_PATTERN` (default `{titre}.({yyyy}).{ext}`). It computes the **OpenSubtitles moviehash** (size + first/last 64 KiB — the subtitle database's own indexing key), asks OpenSubtitles which movie that file *is*, then fills title and year from **TMDB**; when the hash is unknown (02 re-encodes, which changes the hash) it falls back to a TMDB title search built from the already-cleaned filename. Subtitles next to the movie follow it (language suffix kept) and the movie's own folder is renamed when it holds a single film. API keys live in `IDENTIFY_*_API_KEY` and **must never be committed** — enter them in the web GUI, which writes them to the gitignored `00-config.local.py`.
 
-The compose service `convert-h265` mounts `src/public-media` live at `/work` and runs them in sequence: `python3 01-clean-names.py && python3 02-convert-to-h265.py`. The launcher reads `NAS_MOUNT`/`DRY_RUN` via `python3 src/public-media/_common.py KEY` (overlay included), exports `NAS_MOUNT` so compose can interpolate the volume bind and `HOST_UID`/`HOST_GID` so the container doesn't write as root, and prompts to confirm if `DRY_RUN=False` (02 deletes originals).
+  Safety rails, all deliberate: a missing pattern field skips the file (a truncated `2019..mkv` is worse than a dirty name); a fallback (non-hash) match is rejected unless the found title's words overlap the filename (`match_is_plausible`), so a re-run never renames a film after an unrelated one; TMDB's *best* result is chosen rather than its first (`best_result` — searching "Batman The Dark Knight" ranks a documentary first); a sequel number in the found title must appear in the filename too (`sequel_is_consistent` — "Men in Black III" contains all of "Men.In.Black.1", and the year separates neither); two files mapping to the same target collide and are reported in the dry run (`planned`, same idea as 01's `detect_collisions`); existing targets are never overwritten; identifications are cached in `.identify-cache.json` (misses re-tried after `IDENTIFY_MISS_TTL_DAYS`) so quotas survive repeated runs; the file is read once for the hash; and `DRY_RUN` still queries the (read-only) APIs so you can preview every new name.
+
+The compose service `convert-h265` mounts `src/public-media` live at `/work`. Since steps are selectable, the launcher does **not** use `docker compose up` (whose `command:` is fixed at 01 → 02); it runs `docker compose build` then `docker compose run --rm -T convert-h265 sh -c "<steps>"`. The launcher reads `NAS_MOUNT`/`DRY_RUN` via `python3 src/public-media/_common.py KEY` (overlay included), exports `NAS_MOUNT` so compose can interpolate the volume bind and `HOST_UID`/`HOST_GID` so the container doesn't write as root, and prompts to confirm if `DRY_RUN=False` (02 deletes originals).
 
 Run it:
 
 ```bash
-./run-public-media-pipeline.sh        # prompts to confirm if DRY_RUN=False
-./run-public-media-pipeline.sh -y     # skip the confirmation
+./run-public-media-pipeline.sh          # 01 + 02 (default); prompts if DRY_RUN=False
+./run-public-media-pipeline.sh -y       # skip the confirmation
+./run-public-media-pipeline.sh 03       # only the online identification
+./run-public-media-pipeline.sh 01 02 03 # everything
 ```
+
+03 is **not** in the default step list on purpose: it calls external APIs and renames the whole library.
 
 ## The perso pipeline (`src/perso-media/`)
 
@@ -83,8 +90,8 @@ The orchestrator mounts the perso scripts live (`-v src/perso-media:/work`), so 
 
 A small **local web app** to launch, monitor and configure both pipelines from a browser instead of the CLI. **Stdlib-only Python** (`http.server`) — no pip deps on the host, consistent with the rest of the repo. It runs on the **host** (it must invoke `docker`/the launchers), reuses no business logic of its own, and **shells out to the two `run-*-pipeline.sh` launchers** in a subprocess.
 
-- [src/gui/server.py](src/gui/server.py) — threaded HTTP server. A single global `RunManager` enforces **one run at a time** (GPU/Docker are serial), buffers log lines, and streams them over **SSE** (`/api/stream`). Runs are launched with `start_new_session=True`; **Stop** sends `SIGINT` to the process group (so `docker compose`/`docker run` shut down cleanly), escalating to `SIGKILL` after ~12s. The `PIPELINES` dict is the single source of truth for each pipeline's launcher, config path, steps, and **editable config fields** (whitelisted; typed `bool`/`int`/`str`/`str_or_none`/`list`/`choice`).
-- [src/gui/index.html](src/gui/index.html) — one self-contained page (vanilla JS, no build step). Tabs per pipeline; dry-run/real selector (mapped to the launchers' `--dry-run`/`--real` flags, real prompts to confirm); step checkboxes (`01/02/03/04`) for perso; live log console; a form to edit the `00-config.py`.
+- [src/gui/server.py](src/gui/server.py) — threaded HTTP server. Step entries are `[id, desc]` or `[id, desc, checked_by_default]` (public `03` uses `False`); a field may carry `"secret": True` to render masked (API keys). A single global `RunManager` enforces **one run at a time** (GPU/Docker are serial), buffers log lines, and streams them over **SSE** (`/api/stream`). Runs are launched with `start_new_session=True`; **Stop** sends `SIGINT` to the process group (so `docker compose`/`docker run` shut down cleanly), escalating to `SIGKILL` after ~12s. The `PIPELINES` dict is the single source of truth for each pipeline's launcher, config path, steps, and **editable config fields** (whitelisted; typed `bool`/`int`/`str`/`str_or_none`/`list`/`choice`).
+- [src/gui/index.html](src/gui/index.html) — one self-contained page (vanilla JS, no build step). Tabs per pipeline; dry-run/real selector (mapped to the launchers' `--dry-run`/`--real` flags, real prompts to confirm); step checkboxes (`01/02/03/04` perso, `01/02/03` public); live log console; a form to edit the `00-config.py`.
 - [run-gui.sh](run-gui.sh) — launcher: `./run-gui.sh [PORT] [HOST]` (default `8765` on `0.0.0.0`).
 
 **Config editing writes a generated overlay, never the tracked file**: `write_overlay()` reads the current effective values (`00-config.py` + existing overlay, same as the launchers) and re-serializes every whitelisted field into `00-config.local.py` (temp + `os.replace`). The previous regex rewrite of `00-config.py` produced a `git status` diff on every launch and mangled any value containing a `#` (taken for a comment). When adding an editable field, add it to the pipeline's `fields` list in `PIPELINES` — the UI, the overlay writer and its `_literal()` serializer are all driven from there.
@@ -148,7 +155,9 @@ The image contains **no project script or config** — both launchers always mou
 `python3 -m unittest discover -s tests -v` — stdlib only, no NAS, no GPU, no pip
 dependency (piexif is stubbed to import the enrich step). They cover the pure
 functions that produced silent bugs: name cleaning, date/timezone parsing,
-filename- and folder-derived dates, the scan cache, and the config overlay. Add a
+filename- and folder-derived dates, the scan cache, the config overlay, and
+step 03's pure parts (rename pattern, moviehash, filename-derived title/year,
+companion subtitles, match plausibility). Add a
 case here rather than reasoning about these by hand.
 
 ## NAS mounting (WSL host — `/etc/`)

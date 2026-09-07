@@ -35,7 +35,9 @@ ROOT = GUI_DIR.parent.parent  # …/HorusScripts
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Définition des pipelines : lanceur, config éditable, étapes.
-# type ∈ {bool, int, str, str_or_none, list, choice}
+# type ∈ {bool, int, float, str, str_or_none, list, choice}
+# Une étape s'écrit [id, description] ou [id, description, cochée_par_défaut].
+# Un champ marqué "secret": True s'affiche masqué (clés d'API).
 # ──────────────────────────────────────────────────────────────────────────────
 PRESET_CHOICES = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
 
@@ -125,10 +127,19 @@ PIPELINES = {
         ],
     },
     "public": {
-        "label": "Public (films/séries → noms propres + HEVC)",
+        "label": "Public (films → noms propres, HEVC, identification en ligne)",
         "launcher": "run-public-media-pipeline.sh",
         "config": "src/public-media/00-config.py",
-        "steps": None,  # 01 puis 02, toujours enchaînés
+        "steps": [
+            ["01", "clean — nettoie les noms (jetons techniques)"],
+            ["02", "convert — ré-encode en HEVC (supprime les originaux)"],
+            [
+                "03",
+                "identify — identifie les films en ligne et les renomme "
+                "(OpenSubtitles + TMDB)",
+                False,
+            ],
+        ],
         "fields": [
             {
                 "key": "DRY_RUN",
@@ -169,10 +180,89 @@ PIPELINES = {
                 "help": "480p / 720p / 1080p / 1440p / 2160p / 4k, ou vide pour aucun.",
             },
             {
+                "key": "CONVERT_MAX_BITRATE",
+                "type": "float",
+                "label": "Débit max, Mb/s (CONVERT_MAX_BITRATE)",
+                "help": "Ré-encode tout fichier au-dessus, même déjà en HEVC — "
+                "le seul réglage qui vise la taille. 0 = désactivé.",
+            },
+            {
                 "key": "NOTIFY_WEBHOOK",
                 "type": "str_or_none",
                 "label": "Webhook de fin de run (NOTIFY_WEBHOOK)",
                 "help": "URL ntfy/webhook, ou vide pour aucune notification.",
+            },
+            # ── Étape 03 : identification en ligne des films ──────────────
+            {
+                "key": "IDENTIFY_PATTERN",
+                "type": "str",
+                "label": "Motif de renommage (IDENTIFY_PATTERN)",
+                "help": "Champs : {annee} (ou {yyyy}), {titre}, {titre_vo}, "
+                "{ext}. {ext} est obligatoire.",
+            },
+            {
+                "key": "IDENTIFY_FOLDERS",
+                "type": "list",
+                "label": "Dossiers de films à identifier (IDENTIFY_FOLDERS)",
+                "help": "Un chemin par ligne. FILMS UNIQUEMENT (le motif n'a "
+                "pas de sens pour une série).",
+            },
+            {
+                "key": "IDENTIFY_OPENSUBTITLES_API_KEY",
+                "type": "str_or_none",
+                "secret": True,
+                "label": "Clé API OpenSubtitles",
+                "help": "opensubtitles.com/consumers — identification par "
+                "empreinte du fichier. Vide = repli sur la recherche par titre.",
+            },
+            {
+                "key": "IDENTIFY_TMDB_API_KEY",
+                "type": "str_or_none",
+                "secret": True,
+                "label": "Clé API TMDB (v3)",
+                "help": "themoviedb.org/settings/api — titre localisé et année. "
+                "Sans elle, seule l'identification par empreinte fonctionne.",
+            },
+            {
+                "key": "IDENTIFY_LANGUAGE",
+                "type": "str",
+                "label": "Langue des titres (IDENTIFY_LANGUAGE)",
+                "help": "Code TMDB, ex. fr-FR ou en-US.",
+            },
+            {
+                "key": "IDENTIFY_SPACE_REPLACEMENT",
+                "type": "str_or_none",
+                "label": "Remplacement des espaces (IDENTIFY_SPACE_REPLACEMENT)",
+                "help": "« . » pour Le.Prénom ; vide pour garder les espaces.",
+            },
+            {
+                "key": "IDENTIFY_FALLBACK_TITLE_SEARCH",
+                "type": "bool",
+                "label": "Repli recherche par titre (IDENTIFY_FALLBACK_TITLE_SEARCH)",
+                "help": "Indispensable après 02 : le ré-encodage change "
+                "l'empreinte, le fichier n'est plus reconnu par hash.",
+            },
+            {
+                "key": "IDENTIFY_RENAME_SUBTITLES",
+                "type": "bool",
+                "label": "Renommer aussi les sous-titres (IDENTIFY_RENAME_SUBTITLES)",
+            },
+            {
+                "key": "IDENTIFY_RENAME_FOLDER",
+                "type": "bool",
+                "label": "Renommer le dossier du film (IDENTIFY_RENAME_FOLDER)",
+                "help": "Seulement s'il ne contient qu'un seul film.",
+            },
+            {
+                "key": "IDENTIFY_REQUEST_DELAY",
+                "type": "float",
+                "label": "Délai entre appels d'API, s (IDENTIFY_REQUEST_DELAY)",
+            },
+            {
+                "key": "IDENTIFY_MAX_FILES",
+                "type": "int",
+                "label": "Films max par run (IDENTIFY_MAX_FILES)",
+                "help": "0 = illimité. Utile pour tester sans brûler le quota.",
             },
         ],
     },
@@ -221,6 +311,8 @@ def coerce(field, raw):
         return bool(raw)
     if t == "int":
         return int(raw)
+    if t == "float":
+        return float(raw)
     if t in ("str", "choice"):
         return str(raw)
     if t == "str_or_none":
@@ -241,6 +333,8 @@ def _literal(field, value):
         return "True" if value else "False"
     if t == "int":
         return str(int(value))
+    if t == "float":
+        return repr(float(value))
     if t in ("str", "choice"):
         return json.dumps(value, ensure_ascii=False)
     if t == "str_or_none":

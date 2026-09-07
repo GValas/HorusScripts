@@ -8,7 +8,7 @@ piexif, rclone).
 
 | Pipeline | Dossier | Lanceur | Rôle |
 |---|---|---|---|
-| **Public** | [`src/public-media/`](src/public-media/) | [`run-public-media-pipeline.sh`](run-public-media-pipeline.sh) | Nettoie les noms + ré-encode films/séries en HEVC |
+| **Public** | [`src/public-media/`](src/public-media/) | [`run-public-media-pipeline.sh`](run-public-media-pipeline.sh) | Nettoie les noms + ré-encode films/séries en HEVC + identifie les films en ligne |
 | **Perso** | [`src/perso-media/`](src/perso-media/) | [`run-perso-media-pipeline.sh`](run-perso-media-pipeline.sh) | Photos/vidéos perso : normalise → date → compresse → upload Google Photos |
 
 > ⚠️ Le NAS doit toujours être adressé via **`/mnt/wsl/horus`**, jamais
@@ -19,7 +19,8 @@ piexif, rclone).
 
 ## Pipeline public — `src/public-media/`
 
-Deux scripts enchaînés sur les mêmes dossiers (`INPUT_FOLDERS`) :
+Trois étapes sur les mêmes dossiers (`INPUT_FOLDERS`), **01 et 02 par défaut**,
+**03 à la demande** :
 
 1. [`01-clean-names`](src/public-media/01-clean-names.py) — nettoie les noms de
    dossiers/fichiers (retire `1080p`, `x264`…, normalise casse et séparateurs, met
@@ -32,16 +33,40 @@ Deux scripts enchaînés sur les mêmes dossiers (`INPUT_FOLDERS`) :
    récursivement tout ce qui n'est pas déjà en HEVC vers x265 via **NVENC** (GPU
    NVIDIA), conserve toutes les pistes audio/sous-titres, puis **remplace
    l'original** après vérification du nombre de pistes.
+3. [`03-identify-movies`](src/public-media/03-identify-movies.py) — **mode
+   identification en ligne** (optionnel). Calcule l'empreinte *moviehash* de
+   chaque film — la clé d'indexation de la **base de sous-titres OpenSubtitles**,
+   celle qui sert à retrouver les sous-titres d'une copie donnée — interroge
+   cette base pour savoir **de quel film il s'agit**, complète titre et année
+   via **TMDB**, puis renomme le film, ses sous-titres et son dossier selon
+   `IDENTIFY_PATTERN` (défaut : `{titre}.({yyyy}).{ext}` → `Joker.(2019).mkv`).
+   Garde-fous : rien n'est renommé si un champ du motif manque, si la cible
+   existe déjà, si **deux fichiers visent le même nom** (collision signalée dès
+   le dry-run, comme dans 01) ou si le film trouvé ne ressemble pas au nom du
+   fichier ; les résultats sont mis en cache (`.identify-cache.json`) pour
+   ménager les quotas.
 
 Réglages centralisés dans [`src/public-media/00-config.py`](src/public-media/00-config.py)
-(`NAS_MOUNT`, `INPUT_FOLDERS`, `DRY_RUN`, `CLEAN_*`, `CONVERT_*`), partagés par
-les deux scripts — même principe que le pipeline perso, plus d'`env/.env`. Lancement :
+(`NAS_MOUNT`, `INPUT_FOLDERS`, `DRY_RUN`, `CLEAN_*`, `CONVERT_*`, `IDENTIFY_*`),
+partagés par les scripts — même principe que le pipeline perso, plus d'`env/.env`.
+Lancement :
 
 ```bash
-./run-public-media-pipeline.sh        # demande confirmation si DRY_RUN=False
-./run-public-media-pipeline.sh -y     # sans confirmation
-# Tout autre argument est transmis à `docker compose up` (ex: -d).
+./run-public-media-pipeline.sh          # 01 + 02 ; confirmation si DRY_RUN=False
+./run-public-media-pipeline.sh -y       # sans confirmation
+./run-public-media-pipeline.sh 03       # uniquement l'identification en ligne
+./run-public-media-pipeline.sh 01 02 03 # tout
 ```
+
+> L'étape 03 exige au moins une **clé d'API TMDB** (gratuite,
+> [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)) pour le
+> titre et l'année, et idéalement une clé **OpenSubtitles**
+> ([opensubtitles.com/consumers](https://www.opensubtitles.com/consumers)) pour
+> l'identification par empreinte. Sans clé OpenSubtitles — ou après un
+> ré-encodage par 02, qui change l'empreinte — 03 se rabat sur une recherche
+> TMDB par titre/année déduits du nom de fichier. **Ne jamais écrire ces clés
+> dans `00-config.py`** (fichier versionné) : les saisir dans l'interface web,
+> qui les enregistre dans `00-config.local.py` (gitignoré).
 
 ---
 
@@ -106,8 +131,9 @@ Depuis la page tu peux :
 
 - **lancer** un pipeline en mode **simulation (dry-run)** ou **réel** (mappé sur
   les flags `--dry-run`/`--real` des lanceurs ; le mode réel demande confirmation) ;
-- choisir le **sous-ensemble d'étapes** `01/02/03/04` pour le perso (le public
-  enchaîne `01 → 02`) ;
+- choisir le **sous-ensemble d'étapes** : `01/02/03/04` pour le perso,
+  `01/02/03` pour le public (l'étape `03`, identification en ligne, est
+  **décochée par défaut**) ;
 - suivre les **logs en direct** (Server-Sent Events) avec l'état et le code de sortie ;
 - **arrêter** un run en cours (`SIGINT` au groupe de processus, escalade `SIGKILL`) ;
 - **éditer les réglages** (NVENC, workers, `PHOTOS_SRC`/`NAS_MOUNT`,
@@ -226,6 +252,7 @@ par les deux scripts via `importlib` — même principe que le pipeline perso.
 | `CONVERT_EXTENSIONS` | `.mkv .mp4 .avi .m4v .mov` | Conteneurs vidéo scannés |
 | `CONVERT_SKIP_SUFFIX` | `_x265` | Suffixe des fichiers déjà convertis (ignorés) |
 | `CONVERT_MAX_RESOLUTION` | `None` | Résolution max de sortie (`"720p"`, `"1080p"`, `"1440p"`, `"2160p"`/`"4k"`). Les fichiers plus grands sont downscalés (HDR 10-bit préservé, Dolby Vision perdu). `None` = pas de downscale |
+| `CONVERT_MAX_BITRATE` | `None` | Débit max en **Mb/s** (taille × 8 / durée). Au-dessus, le fichier est ré-encodé **même déjà en HEVC et à la bonne résolution** — seul réglage qui vise la *taille* et non la définition. Si le débit est la seule raison et que la sortie n'est pas plus petite, l'original est conservé. `None`/`0` = désactivé |
 | `CLEAN_TECH_WORDS` | (liste) | Mots techniques retirés des noms par 01 |
 | `CLEAN_VIDEO_EXTENSIONS` | `.mkv .mp4 .avi …` | Vidéos renommées par 01 |
 | `CLEAN_SUBTITLE_EXTENSIONS` | `.srt .ass .sub …` | Sous-titres renommés par 01 (suffixe de langue préservé) |
@@ -233,6 +260,18 @@ par les deux scripts via `importlib` — même principe que le pipeline perso.
 | `CONVERT_SCAN_CACHE` | `.scan-cache.json` | Cache ffprobe (codec/dimensions), sauvegardé périodiquement ; `None` pour désactiver |
 | `CONVERT_SCAN_WORKERS` | `8` | Sondes ffprobe parallèles au scan (l'encodage reste séquentiel) |
 | `NOTIFY_WEBHOOK` | `None` | URL ntfy/webhook notifiée en fin de run (succès **et** échec) |
+| `IDENTIFY_FOLDERS` | `…/movies` | Dossiers scannés par 03 — **films uniquement** (le motif n'a pas de sens pour une série) |
+| `IDENTIFY_PATTERN` | `{titre}.({yyyy}).{ext}` | Motif de renommage. Champs : `{annee}` (`{année}`, `{yyyy}`), `{titre}`, `{titre_vo}`, `{ext}` (`{extension}`, obligatoire) |
+| `IDENTIFY_OPENSUBTITLES_API_KEY` | `None` | Clé OpenSubtitles (identification par empreinte). **À saisir via l'interface web**, jamais ici |
+| `IDENTIFY_TMDB_API_KEY` | `None` | Clé TMDB v3 (titre localisé, année). Idem |
+| `IDENTIFY_LANGUAGE` | `fr-FR` | Langue des titres demandés à TMDB |
+| `IDENTIFY_SPACE_REPLACEMENT` | `"."` | Remplacement des espaces dans les champs ; vide = espaces conservés |
+| `IDENTIFY_FALLBACK_TITLE_SEARCH` | `True` | Repli recherche TMDB par titre/année du nom de fichier quand l'empreinte est inconnue |
+| `IDENTIFY_RENAME_SUBTITLES` | `True` | Renomme aussi les sous-titres voisins (suffixe de langue conservé) |
+| `IDENTIFY_RENAME_FOLDER` | `True` | Renomme le dossier du film s'il n'en contient qu'un |
+| `IDENTIFY_EXTENSIONS` | `.mkv .mp4 .avi .m4v .mov` | Conteneurs considérés comme des films par 03 |
+| `IDENTIFY_CACHE` / `IDENTIFY_MISS_TTL_DAYS` | `.identify-cache.json` / `30` | Cache des identifications (les échecs sont re-tentés après ce délai) ; `None` pour désactiver |
+| `IDENTIFY_REQUEST_DELAY` / `IDENTIFY_MAX_FILES` | `0.5` / `0` | Délai entre appels d'API (s) et plafond de films par run (`0` = illimité) |
 
 `NAS_MOUNT` est aussi consommé par `docker compose` pour le mapping de volume :
 le lanceur le lit dans `00-config.py` et l'exporte avant `docker compose up`.
@@ -298,11 +337,12 @@ HorusScripts/
 ├── src/
 │   ├── notify.py                   # Notification de fin de run (commune aux 2 pipelines)
 │   ├── public-media/
-│   │   ├── 00-config.py            # Réglages centralisés des 2 scripts
+│   │   ├── 00-config.py            # Réglages centralisés des 3 scripts
 │   │   ├── 00-config.local.py      # Surcouche générée par l'interface web (gitignorée)
 │   │   ├── _common.py              # Config, espace disque, cache de scan (+ lecture CLI)
 │   │   ├── 01-clean-names.py       # Renommage (avant conversion)
-│   │   └── 02-convert-to-h265.py   # Ré-encodage NVENC HEVC
+│   │   ├── 02-convert-to-h265.py   # Ré-encodage NVENC HEVC
+│   │   └── 03-identify-movies.py   # Identification en ligne + renommage (optionnel)
 │   ├── perso-media/
 │   │   ├── 00-config.py            # Réglages centralisés des 4 étapes
 │   │   ├── 00-config.local.py      # Surcouche générée par l'interface web (gitignorée)

@@ -4,20 +4,21 @@
 
 Tout se règle ici, en variables Python (plus aucune variable d'environnement
 ni env/.env), exactement comme le pipeline perso :
-  - un bloc COMMUN partagé par les deux scripts (NAS_MOUNT, INPUT_FOLDERS,
+  - un bloc COMMUN partagé par les scripts (NAS_MOUNT, INPUT_FOLDERS,
     DRY_RUN) ;
   - un bloc par script :
       01-clean-names.py      -> CLEAN_*
       02-convert-to-h265.py  -> CONVERT_*
+      03-identify-movies.py  -> IDENTIFY_*   (étape optionnelle)
 
-Chargement : les deux scripts et le lanceur passent par _common.load_config() —
+Chargement : les scripts et le lanceur passent par _common.load_config() —
 ce fichier PUIS la surcouche 00-config.local.py si elle existe (générée par
 l'interface web, gitignorée, et qui écrase les valeurs ci-dessous). Le lanceur
 lit NAS_MOUNT / DRY_RUN avec `python3 src/public-media/_common.py CLE`.
 """
 
 # ══════════════════════════════════════════════════════════════════════════════
-# COMMUN  (partagé par 01 et 02)
+# COMMUN  (partagé par 01, 02 et 03)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Racine du montage NAS. En container/local : /mnt/wsl/horus (cf. CLAUDE.md :
@@ -33,7 +34,7 @@ INPUT_FOLDERS = [
     f"{NAS_MOUNT}/movies",
 ]
 
-# Interrupteur UNIQUE de simulation, commun aux deux scripts :
+# Interrupteur UNIQUE de simulation, commun à toutes les étapes :
 #   True  = simulation (aucun renommage ni conversion, rien d'écrit/supprimé) ;
 #   False = exécution réelle — ATTENTION : 02 SUPPRIME les originaux après
 #           conversion réussie.
@@ -122,3 +123,102 @@ CONVERT_SCAN_WORKERS = 8
 #   Valeurs acceptées : "480p", "720p", "1080p", "1440p", "2160p" / "4k", ou None.
 #   None = pas de downscale -> comportement d'origine (on saute ce qui est HEVC).
 CONVERT_MAX_RESOLUTION = None
+
+# Plafond de DÉBIT, en Mb/s (mégabits par seconde), calculé sur le fichier
+# entier (taille × 8 / durée). Tout fichier au-dessus est ré-encodé au CQ
+# configuré — MÊME s'il est déjà en HEVC et à la bonne résolution.
+#
+# C'est le seul levier qui vise la TAILLE : un film peut peser 24 Go en 1080p
+# simplement parce qu'il a été encodé à 29 Mb/s, et CONVERT_MAX_RESOLUTION ne le
+# touchera jamais. Repère : une logithèque HEVC bien encodée tourne autour de
+# 3 Mb/s en 1080p ; 8 Mb/s est déjà confortable.
+#
+# Garde-fou : quand le débit est la SEULE raison de ré-encoder (fichier déjà
+# HEVC et dans la résolution voulue), l'original est conservé si la sortie n'est
+# pas plus petite — sans quoi on dégraderait l'image pour rien.
+#   None = désactivé (comportement d'origine).
+CONVERT_MAX_BITRATE = None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 03 — identify-movies  (mode « identification en ligne », étape OPTIONNELLE)
+#   Identifie chaque film via la base de sous-titres OpenSubtitles (empreinte
+#   « moviehash » du fichier — la même clé qui sert à récupérer ses sous-titres),
+#   complète les métadonnées (titre, année) via TMDB, puis renomme
+#   le film ET ses sous-titres selon IDENTIFY_PATTERN.
+#   Non lancée par défaut : `./run-public-media-pipeline.sh 03` ou la case « 03 »
+#   de l'interface web.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Dossiers scannés par 03. NE DOIT CONTENIR QUE DES FILMS : le motif de
+# nommage (titre + année) n'a pas de sens pour une série.
+IDENTIFY_FOLDERS = [
+    f"{NAS_MOUNT}/movies",
+]
+
+# Motif de renommage. Champs disponibles :
+#   {annee} ({année}, {yyyy}) année de sortie (TMDB, sinon OpenSubtitles)
+#   {titre}                     titre localisé (cf. IDENTIFY_LANGUAGE)
+#   {titre_vo}                  titre original
+#   {ext} (ou {extension})      extension SANS le point (« mkv »)
+# Un fichier dont un champ du motif est introuvable n'est PAS renommé (mieux
+# vaut un nom sale qu'un nom amputé : « 2019..mkv » n'est plus identifiable).
+IDENTIFY_PATTERN = "{titre}.({yyyy}).{ext}"
+
+# Remplacement des espaces dans les champs (« Le Prénom » -> « Le.Prénom »),
+# pour rester cohérent avec le style « points » du reste de la bibliothèque.
+# Mettre None (ou "") pour conserver les espaces.
+IDENTIFY_SPACE_REPLACEMENT = "."
+
+# Langue des titres demandés à TMDB (code ISO type « fr-FR », « en-US »).
+IDENTIFY_LANGUAGE = "fr-FR"
+
+# Clés d'API — NE JAMAIS LES ÉCRIRE ICI (fichier versionné) : les saisir dans
+# l'interface web, qui les enregistre dans la surcouche 00-config.local.py
+# (gitignorée), ou créer ce fichier à la main.
+#   OpenSubtitles : compte gratuit sur https://www.opensubtitles.com/consumers
+#                   -> « New consumer » -> Api Key.
+#   TMDB          : https://www.themoviedb.org/settings/api (clé v3).
+# Sans clé OpenSubtitles, 03 se rabat sur une recherche TMDB par titre/année
+# déduits du nom de fichier (moins fiable). Sans clé TMDB, les titres ne sont
+# pas localisés et seule l'identification par empreinte fonctionne.
+IDENTIFY_OPENSUBTITLES_API_KEY = None
+IDENTIFY_TMDB_API_KEY = None
+
+# Jetons retirés du TITRE envoyé à TMDB, EN PLUS de CLEAN_TECH_WORDS. 01 ne
+# coupe qu'au PREMIER mot technique rencontré : « Any.Given.Sunday.(1999).Dc »
+# ou « Ducobu.L.Eleve.(2011).Vof » gardent leur queue, qui fait échouer la
+# recherche. N'affecte QUE la requête — jamais le nom du fichier.
+# Prudence : n'y mettre que des mots qui ne peuvent pas être un vrai titre
+# (« final », « cut », « part » en feraient échouer de légitimes).
+IDENTIFY_QUERY_NOISE_WORDS = set(
+    (
+        "vof vostf vfq dc dvdri uncut unrated hybrid tvrip muet integrale "
+        "extended remastered bdrip dvd bluray 3d mhd avi mp4 "
+    ).split()
+)
+
+# Repli par recherche TMDB sur le titre/l'année déduits du nom de fichier quand
+# l'empreinte du fichier est inconnue d'OpenSubtitles (copie ré-encodée : le
+# moviehash change à chaque conversion, donc après 02 la plupart des fichiers
+# ne sont plus reconnus par empreinte).
+IDENTIFY_FALLBACK_TITLE_SEARCH = True
+
+# Renomme aussi les sous-titres voisins (« Film.fr.srt » -> « <nouveau nom>.fr.srt »)
+# et le dossier du film quand il ne contient qu'un seul film.
+IDENTIFY_RENAME_SUBTITLES = True
+IDENTIFY_RENAME_FOLDER = True
+
+# Conteneurs considérés comme des films par 03.
+IDENTIFY_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov"}
+
+# Cache des identifications, indexé par empreinte du fichier (gitignoré) : évite
+# de re-consommer le quota d'API à chaque run. Les échecs sont mémorisés
+# IDENTIFY_MISS_TTL_DAYS jours (la base s'enrichit avec le temps).
+# None = pas de cache.
+IDENTIFY_CACHE = ".identify-cache.json"
+IDENTIFY_MISS_TTL_DAYS = 30
+
+# Politesse / quotas : délai (s) entre deux appels d'API, et plafond de fichiers
+# traités par run (0 = illimité) — utile pour tester sans brûler le quota.
+IDENTIFY_REQUEST_DELAY = 0.5
+IDENTIFY_MAX_FILES = 0

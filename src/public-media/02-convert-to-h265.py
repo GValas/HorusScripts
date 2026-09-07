@@ -73,7 +73,7 @@ SCAN_CACHE_PATH = (
 SCAN_WORKERS = getattr(config, "CONVERT_SCAN_WORKERS", 1)  # sondes // au scan
 # Schéma des entrées du cache : à incrémenter dès qu'on stocke un champ de plus,
 # pour invalider proprement les caches écrits par une version antérieure.
-SCAN_CACHE_VERSION = 2
+SCAN_CACHE_VERSION = 3
 # Sauvegarde intermédiaire du cache tous les N fichiers sondés : un run de
 # plusieurs heures interrompu (Ctrl-C, bouton « Arrêter » de l'interface web) ne
 # doit pas perdre l'intégralité du travail de scan.
@@ -100,7 +100,33 @@ else:
             f"(attendu : None ou {', '.join(RESOLUTION_LIMITS)})"
         )
     MAX_WIDTH, MAX_HEIGHT = RESOLUTION_LIMITS[_key]
+
+# Plafond de débit (Mb/s) ; None = pas de contrôle de débit.
+MAX_BITRATE = getattr(config, "CONVERT_MAX_BITRATE", None)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def bitrate_mbps(size_bytes, duration_s):
+    """Débit moyen du fichier en Mb/s, ou None si indéterminable."""
+    if not size_bytes or not duration_s or duration_s <= 0:
+        return None
+    return size_bytes * 8 / duration_s / 1_000_000
+
+
+def exceeds_bitrate(size_bytes, duration_s, limit_mbps) -> bool:
+    """True si le fichier dépasse `limit_mbps` (None/0 = contrôle désactivé).
+
+    Le plafond est passé explicitement plutôt que lu dans la config : cette
+    fonction décide de ré-encoder, donc de SUPPRIMER un original, et son
+    résultat ne doit dépendre que de ses arguments.
+
+    Un débit indéterminable (durée absente ou nulle, fichier vide) renvoie
+    False : on ne ré-encode pas sur la foi d'une mesure qu'on n'a pas pu faire.
+    """
+    if not limit_mbps:
+        return False
+    rate = bitrate_mbps(size_bytes, duration_s)
+    return rate is not None and rate > limit_mbps
 
 
 def needs_downscale(width, height) -> bool:
@@ -112,7 +138,12 @@ def needs_downscale(width, height) -> bool:
 
 
 def get_video_info(filepath: Path) -> dict:
-    """Use ffprobe to detect all streams in a file."""
+    """Use ffprobe to detect all streams in a file.
+
+    `-show_format` est demandé dans le MÊME appel que `-show_streams` : la durée
+    sert au contrôle de débit du scan, et une seconde sonde par fichier doublerait
+    le coût du scan sur toute la bibliothèque.
+    """
     cmd = [
         "ffprobe",
         "-v",
@@ -120,6 +151,7 @@ def get_video_info(filepath: Path) -> dict:
         "-print_format",
         "json",
         "-show_streams",
+        "-show_format",
         str(filepath),
     ]
     try:
@@ -152,10 +184,16 @@ def get_video_info(filepath: Path) -> dict:
             elif t == "subtitle":
                 sub_codecs.append(c)
 
+        try:
+            duration = float((data.get("format") or {}).get("duration"))
+        except (TypeError, ValueError):
+            duration = None
+
         return {
             "codec": codec,
             "width": width,
             "height": height,
+            "duration": duration,
             "pix_fmt": pix_fmt,
             "color_trc": color_trc,
             "color_primaries": color_primaries,
@@ -172,6 +210,7 @@ def get_video_info(filepath: Path) -> dict:
             "codec": None,
             "width": None,
             "height": None,
+            "duration": None,
             "pix_fmt": None,
             "color_trc": None,
             "color_primaries": None,
@@ -209,32 +248,50 @@ def save_scan_cache(cache: dict) -> None:
     _common.save_scan_cache(SCAN_CACHE_PATH, cache, SCAN_CACHE_VERSION)
 
 
-def probe_for_scan(f: Path, cache: dict) -> tuple:
-    """(codec, width, height) pour la décision de scan, avec cache (mtime+size).
+def scan_cache_entry(st, info: dict) -> dict:
+    """Entrée du cache de scan pour un fichier.
 
-    Sur hit de cache valide, on évite l'appel ffprobe ; sinon on sonde et on
-    mémorise. La conversion elle-même re-sonde toujours le fichier en entier.
+    UNE seule définition pour les DEUX chemins d'écriture (scan séquentiel et
+    pré-sondage parallèle). Quand ils divergeaient, la clé oubliée d'un côté —
+    la durée, écrite par le chemin parallèle qui traite la quasi-totalité des
+    fichiers — rendait le contrôle de débit silencieusement inopérant.
     """
-    try:
-        st = f.stat()
-    except OSError:
-        info = get_video_info(f)
-        return info["codec"], info["width"], info["height"]
-
-    key = str(f)
-    ent = cache.get(key)
-    if _common.cache_entry_valid(ent, st):
-        return ent.get("codec"), ent.get("width"), ent.get("height")
-
-    info = get_video_info(f)
-    cache[key] = {
+    return {
         "mtime": int(st.st_mtime),
         "size": st.st_size,
         "codec": info["codec"],
         "width": info["width"],
         "height": info["height"],
+        "duration": info["duration"],
     }
-    return info["codec"], info["width"], info["height"]
+
+
+def probe_for_scan(f: Path, cache: dict) -> tuple:
+    """(codec, width, height, duration) pour la décision de scan, avec cache.
+
+    Sur hit de cache valide (mtime+size), on évite l'appel ffprobe ; sinon on
+    sonde et on mémorise. La conversion elle-même re-sonde toujours le fichier
+    en entier. La durée sert au contrôle de débit (CONVERT_MAX_BITRATE).
+    """
+    try:
+        st = f.stat()
+    except OSError:
+        info = get_video_info(f)
+        return info["codec"], info["width"], info["height"], info["duration"]
+
+    key = str(f)
+    ent = cache.get(key)
+    if _common.cache_entry_valid(ent, st):
+        return (
+            ent.get("codec"),
+            ent.get("width"),
+            ent.get("height"),
+            ent.get("duration"),
+        )
+
+    info = get_video_info(f)
+    cache[key] = scan_cache_entry(st, info)
+    return info["codec"], info["width"], info["height"], info["duration"]
 
 
 def prewarm_scan(candidates: list, cache: dict) -> None:
@@ -264,13 +321,7 @@ def prewarm_scan(candidates: list, cache: dict) -> None:
 
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         for i, (key, st, info) in enumerate(ex.map(work, misses), 1):
-            cache[key] = {
-                "mtime": int(st.st_mtime),
-                "size": st.st_size,
-                "codec": info["codec"],
-                "width": info["width"],
-                "height": info["height"],
-            }
+            cache[key] = scan_cache_entry(st, info)
             # Flush périodique : sonder une grosse bibliothèque prend des
             # dizaines de minutes ; une interruption ne doit pas tout perdre.
             if i % SCAN_CACHE_FLUSH_EVERY == 0:
@@ -281,7 +332,7 @@ def prewarm_scan(candidates: list, cache: dict) -> None:
 enough_space = _common.enough_space
 
 
-def convert_to_x265(input_path: Path) -> bool:
+def convert_to_x265(input_path: Path, require_smaller: bool = False) -> bool:
     """Convert a file to x265 using NVENC, preserving all streams."""
     output_path = input_path.with_name(input_path.stem + "_x265.mkv")
 
@@ -440,6 +491,22 @@ def convert_to_x265(input_path: Path) -> bool:
                 f"expected {expected_subs}, got {out_info['subtitle_tracks']}"
             )
 
+        # Conversion motivée par la TAILLE (downscale ou débit) : si la sortie
+        # n'est pas plus petite, on a perdu de la définition ET gagné du poids.
+        # L'original est strictement meilleur — on le garde.
+        # Vécu : un 4K bien encodé (15 Mb/s) redescendu en 1440p par NVENC à
+        # CQ 26 est ressorti 4 % PLUS gros. NVENC est moins efficace qu'un x265
+        # logiciel soigné : réduire la définition ne garantit pas de réduire le
+        # poids. Seule la conversion de CODEC (non-HEVC -> HEVC) échappe à cette
+        # règle : elle vise la normalisation, pas l'espace disque.
+        if require_smaller and new_bytes >= old_bytes:
+            log(
+                f"  [!] Sortie plus grosse que l'original "
+                f"({new_mb:.1f}MB ≥ {old_mb:.1f}MB) — original conservé"
+            )
+            output_path.unlink()
+            return True
+
         if not (audio_ok and sub_ok):
             log(
                 f"  [✗] Stream count mismatch — kept for inspection: {output_path.name}"
@@ -521,17 +588,52 @@ def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
     prewarm_scan(candidates, cache)
 
     to_convert = []
+    undetected = 0
     for f in candidates:
-        codec, width, height = probe_for_scan(f, cache)
+        codec, width, height, duration = probe_for_scan(f, cache)
         too_big = needs_downscale(width, height)
+        try:
+            size = f.stat().st_size
+        except OSError:
+            size = None
+        too_fat = exceeds_bitrate(size, duration, MAX_BITRATE)
         if codec is None:
+            undetected += 1
             log(f"  [?] Could not detect codec: {f.name}")
-        elif codec in ("hevc", "h265") and not too_big:
+        elif codec in ("hevc", "h265") and not too_big and not too_fat:
             log(f"  [=] Already x265, skipping: {f.relative_to(root_path)}")
         else:
-            reason = f"downscale {width}x{height}" if too_big else f"not x265 ({codec})"
+            if too_big:
+                reason = f"downscale {width}x{height}"
+            elif codec not in ("hevc", "h265"):
+                reason = f"not x265 ({codec})"
+            else:
+                reason = f"bitrate {bitrate_mbps(size, duration):.1f} Mb/s"
             log(f"  [!] To convert ({reason}): {f.relative_to(root_path)}")
-            to_convert.append(f)
+            # Conversion motivée par la taille (downscale et/ou débit) sur un
+            # fichier DÉJÀ en HEVC : la sortie doit être plus petite, sinon on
+            # a dégradé pour rien. Une conversion de codec, elle, doit aboutir
+            # quoi qu'il arrive : c'est une normalisation.
+            for_size = (too_big or too_fat) and codec in ("hevc", "h265")
+            to_convert.append((f, for_size))
+
+    # Aucun codec détecté nulle part = ffprobe injoignable (script lancé hors du
+    # conteneur), pas une bibliothèque déjà conforme. Sans ce garde-fou le run
+    # se terminait avec 0 conversion ET un code de sortie 0 : un échec total
+    # indiscernable d'un run propre — exactement ce que les autres étapes
+    # refusent. On vide aussi le cache des entrées vides qu'on vient d'écrire,
+    # sinon elles feraient sauter tous les fichiers au run suivant.
+    if candidates and undetected == len(candidates):
+        for f in candidates:
+            cache.pop(str(f), None)
+        save_scan_cache(cache)
+        log(
+            f"\n[✗] Aucun codec détecté sur les {len(candidates)} fichiers — "
+            f"ffprobe est-il disponible ?"
+        )
+        log("    Ces scripts doivent tourner dans le conteneur : "
+            "utilise ./run-public-media-pipeline.sh")
+        return 0, len(candidates)
 
     save_scan_cache(cache)  # les sondes faites ici (scan séquentiel) sont acquises
 
@@ -540,14 +642,14 @@ def scan_and_convert(root: str, cache: dict) -> tuple[int, int]:
         log("[✓] Nothing to do!")
         return 0, 0
 
-    total_size_mb = sum(f.stat().st_size for f in to_convert) / 1024 / 1024
+    total_size_mb = sum(f.stat().st_size for f, _ in to_convert) / 1024 / 1024
     log(f"[*] Total size to convert: {total_size_mb:.1f} MB\n")
     log("─" * 60)
 
     success, failed = 0, 0
-    for i, filepath in enumerate(to_convert, 1):
+    for i, (filepath, require_smaller) in enumerate(to_convert, 1):
         log(f"\n[{i}/{len(to_convert)}] {filepath.relative_to(root_path)}")
-        if convert_to_x265(filepath):
+        if convert_to_x265(filepath, require_smaller=require_smaller):
             success += 1
         else:
             failed += 1

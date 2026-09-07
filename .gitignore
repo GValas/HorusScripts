@@ -20,6 +20,11 @@ rapport.csv
 # Cache de scan ffprobe (codec/dimensions par fichier) — généré, non versionné
 .scan-cache.json
 **/.scan-cache.json
+
+# Cache d'identification des films (empreinte -> titre/année) —
+# généré par 03-identify-movies.py, non versionné
+.identify-cache.json
+**/.identify-cache.json
 *.tmp
 
 # Fichiers log de conversion — générés, non versionnés
