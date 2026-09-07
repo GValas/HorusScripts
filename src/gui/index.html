@@ -5,87 +5,149 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>horus — pipelines</title>
 <style>
+  /* Thème clair, dense. Deux colonnes : réglages à gauche, logs à droite ;
+     la barre d'actions reste collée en haut, les logs collés à leur colonne. */
   :root {
-    --bg: #0f1117; --panel: #181b24; --panel2: #1f2430; --line: #2a3040;
-    --fg: #e6e8ee; --muted: #9aa3b2; --accent: #4f9cf9; --ok: #3fb950;
-    --warn: #d29922; --danger: #f85149; --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    --bg: #f6f7f9; --card: #ffffff; --soft: #f1f3f7; --line: #e3e7ee;
+    --fg: #111827; --muted: #6b7280; --accent: #4f46e5; --accent-soft: #eef2ff;
+    --ok: #059669; --warn: #b45309; --danger: #dc2626;
+    --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    --r: 9px;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--line);
-    display: flex; align-items: center; gap: 16px; }
-  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-  .tag { font-size: 12px; color: var(--muted); }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 20px; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 16px; }
-  .tabs button { background: var(--panel); color: var(--muted); border: 1px solid var(--line);
-    padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; }
-  .tabs button.active { background: var(--panel2); color: var(--fg); border-color: var(--accent); }
-  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    padding: 18px; margin-bottom: 16px; }
-  .panel h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase;
-    letter-spacing: .04em; color: var(--muted); }
-  .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
-  .modes label, .steps label { display: inline-flex; align-items: center; gap: 6px;
-    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-    padding: 7px 12px; cursor: pointer; }
-  .steps { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-  button.act { border: none; border-radius: 8px; padding: 10px 20px; font-size: 14px;
-    font-weight: 600; cursor: pointer; }
-  button.go { background: var(--accent); color: #06182f; }
-  button.stop { background: var(--danger); color: #2a0606; }
-  button.save { background: var(--panel2); color: var(--fg); border: 1px solid var(--line); }
-  button:disabled { opacity: .45; cursor: not-allowed; }
-  .real-warn { color: var(--warn); font-size: 13px; }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 22px; }
-  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
-  .field { display: flex; flex-direction: column; gap: 4px; }
-  .field label { font-size: 13px; color: var(--fg); }
-  .field .help, .panel > .help { font-size: 11.5px; color: var(--muted); }
+    font: 13px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+
+  /* ── barre d'actions ── */
+  .topbar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center;
+    gap: 10px; padding: 7px 16px; background: rgba(255,255,255,.92);
+    backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); }
+  .brand { font-weight: 650; font-size: 13.5px; letter-spacing: -.01em; }
+  .spacer { flex: 1; }
+
+  /* Sélecteurs segmentés : onglets de pipeline et choix du mode. */
+  .seg { display: inline-flex; gap: 2px; padding: 2px; background: var(--soft);
+    border: 1px solid var(--line); border-radius: 8px; }
+  .seg button, .seg label { border: 0; background: transparent; color: var(--muted);
+    padding: 3px 10px; border-radius: 6px; font: inherit; font-size: 12.5px;
+    cursor: pointer; white-space: nowrap; }
+  .seg button.active, .seg input:checked + label { background: var(--card); color: var(--fg);
+    box-shadow: 0 1px 2px rgba(17,24,39,.10); }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg input:checked + label.real { color: var(--danger); }
+
+  .btn { border: 1px solid var(--line); background: var(--card); color: var(--fg);
+    border-radius: 7px; padding: 4px 12px; font: inherit; font-size: 12.5px;
+    font-weight: 550; cursor: pointer; }
+  .btn:hover:not(:disabled) { background: var(--soft); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn.danger { background: var(--card); border-color: #f3c7c7; color: var(--danger); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* ── colonnes ── */
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(380px, 40%);
+    gap: 12px; align-items: start; padding: 12px 16px 20px; }
+  @media (max-width: 1080px) { .cols { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--r);
+    padding: 10px 14px; margin-bottom: 10px; }
+  .card > h2 { margin: 0 0 7px; font-size: 10.5px; font-weight: 650;
+    text-transform: uppercase; letter-spacing: .07em; color: var(--muted); }
+  .note { font-size: 11px; color: var(--muted); }
+  .note.warn { color: var(--warn); }
+  .note.err { color: var(--danger); }
+  .note.ok { color: var(--ok); }
+
+  /* ── étapes : un interrupteur, un titre, puis ses réglages ── */
+  .step { padding: 9px 0; border-top: 1px solid var(--line); }
+  .step:first-of-type { border-top: 0; padding-top: 2px; }
+  .step-head { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .step-num { font-family: var(--mono); font-size: 11px; font-weight: 600;
+    color: var(--accent); background: var(--accent-soft); border-radius: 5px;
+    padding: 1px 6px; }
+  .step-title { font-weight: 600; }
+  .step-desc { color: var(--muted); font-weight: 400; }
+  .step-body { margin: 5px 0 0 38px; }
+  .step.off .step-body { opacity: .45; }
+
+  /* Interrupteur (étapes + réglages booléens) plutôt qu'une case à cocher. */
+  .switch { appearance: none; -webkit-appearance: none; flex: none; position: relative;
+    width: 30px; height: 17px; border-radius: 999px; background: #d3d8e0;
+    border: 0; cursor: pointer; transition: background .15s; }
+  .switch:checked { background: var(--accent); }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px;
+    width: 13px; height: 13px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 2px rgba(17,24,39,.3); transition: transform .15s; }
+  .switch:checked::after { transform: translateX(13px); }
+
+  /* ── réglages : libellé à gauche (colonne fixe), valeur à droite ── */
+  .field { display: grid; grid-template-columns: 260px minmax(0, 1fr);
+    gap: 2px 14px; align-items: center; padding: 2.5px 0; }
+  .field > label { font-size: 12.5px; }
+  .field .value { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .field .help { font-size: 11px; line-height: 1.3; color: var(--muted); max-width: 460px; }
+  .field .key { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
   .field input[type=text], .field input[type=password], .field input[type=number],
   .field select, .field textarea {
-    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
-    border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit; }
-  .field textarea { min-height: 70px; font-family: var(--mono); resize: vertical; }
-  .field.bool { flex-direction: row; align-items: center; gap: 8px; }
-  .console { background: #07090e; border: 1px solid var(--line); border-radius: 10px;
-    height: 46vh; overflow: auto; padding: 12px 14px; font-family: var(--mono);
-    font-size: 12.5px; white-space: pre-wrap; color: #cdd3df; }
+    background: var(--card); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 8px; font: inherit; font-size: 12.5px; width: 100%; }
+  .field input[type=text], .field input[type=password] { max-width: 360px; }
+  .field input[type=number] { max-width: 96px; }
+  .field select { width: auto; max-width: 150px; }
+  .field textarea { max-width: 440px; min-height: 46px; font-family: var(--mono);
+    font-size: 12px; resize: vertical; }
+  .field :focus-visible { outline: 2px solid rgba(79,70,229,.4); outline-offset: 1px;
+    border-color: var(--accent); }
+  @media (max-width: 720px) { .field { grid-template-columns: 1fr; align-items: start; } }
+
+  /* ── logs ── */
+  .logs { position: sticky; top: 50px; }
+  .logs-head { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #c3c9d4; flex: none; }
+  .dot.run { background: var(--ok); box-shadow: 0 0 0 3px rgba(5,150,105,.18);
+    animation: pulse 1.3s infinite; }
+  .dot.err { background: var(--danger); box-shadow: 0 0 0 3px rgba(220,38,38,.15); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .console { background: #fbfcfe; border: 1px solid var(--line); border-radius: 7px;
+    height: calc(100vh - 132px); min-height: 240px; overflow: auto; padding: 8px 10px;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.4;
+    white-space: pre-wrap; color: #26313f; }
   .console .cmd { color: var(--accent); }
   .console .end { color: var(--warn); }
-  .statusbar { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
-  .dot.run { background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: pulse 1.2s infinite; }
-  .dot.err { background: var(--danger); }
-  @keyframes pulse { 50% { opacity: .4; } }
-  .toast { font-size: 13px; }
-  .toast.ok { color: var(--ok); } .toast.err { color: var(--danger); }
-  .spacer { flex: 1; }
 </style>
 </head>
 <body>
-<header>
-  <h1>🦅 horus</h1>
-  <span class="tag">lancement &amp; pilotage des pipelines média</span>
+
+<header class="topbar">
+  <span class="brand">🦅 horus</span>
+  <div class="seg" id="tabs"></div>
+  <span class="spacer"></span>
+  <span class="note warn" id="realWarn" style="display:none">⚠ opérations destructrices</span>
+  <div class="seg" id="modes">
+    <input type="radio" name="mode" id="mode-dry" value="dry-run" checked>
+    <label for="mode-dry">Simulation</label>
+    <input type="radio" name="mode" id="mode-real" value="real">
+    <label for="mode-real" class="real">Réel</label>
+  </div>
+  <span class="note" id="cfgToast"></span>
+  <button class="btn" id="saveBtn">Enregistrer</button>
+  <button class="btn primary" id="goBtn">Lancer</button>
+  <button class="btn danger" id="stopBtn" disabled>Arrêter</button>
 </header>
 
-<div class="wrap">
-  <div class="tabs" id="tabs"></div>
-  <div id="panels"></div>
-
-  <div class="panel">
-    <div class="statusbar">
+<main class="cols">
+  <section id="panels"></section>
+  <section class="logs">
+    <div class="logs-head">
       <span class="dot" id="dot"></span>
       <strong id="statusText">Inactif</strong>
-      <span class="tag" id="statusMeta"></span>
+      <span class="note" id="statusMeta"></span>
       <span class="spacer"></span>
-      <button class="act stop" id="stopBtn" disabled>Arrêter</button>
-      <button class="save" id="clearBtn">Effacer les logs</button>
+      <button class="btn" id="clearBtn">Effacer</button>
     </div>
     <div class="console" id="console"></div>
-  </div>
-</div>
+  </section>
+</main>
 
 <script>
 let META = null;
@@ -124,22 +186,22 @@ function buildTabs() {
   for (const [key, p] of Object.entries(META.pipelines)) {
     tabs.append(el("button", {
       class: key === CURRENT ? "active" : "",
-      text: p.label,
+      text: p.short || key,
+      title: p.label,
       onclick: () => { CURRENT = key; render(); },
     }));
   }
 }
 
+const inputId = (p, k) => `cfg-${p}-${k}`;
+
 function fieldInput(pipeline, f, value) {
-  if (f.type === "bool") {
-    const cb = el("input", {type: "checkbox", id: inputId(pipeline, f.key)});
-    cb.checked = !!value;
-    return el("div", {class: "field bool"}, cb,
-      el("div", {}, el("label", {for: cb.id, text: f.label}),
-        f.help ? el("div", {class: "help", text: f.help}) : ""));
-  }
+  // Libellé à gauche, valeur à droite ; booléens rendus en interrupteur.
   let input;
-  if (f.type === "choice") {
+  if (f.type === "bool") {
+    input = el("input", {type: "checkbox", class: "switch", id: inputId(pipeline, f.key)});
+    input.checked = !!value;
+  } else if (f.type === "choice") {
     input = el("select", {id: inputId(pipeline, f.key)});
     f.choices.forEach(c => {
       const o = el("option", {value: c, text: c});
@@ -159,12 +221,15 @@ function fieldInput(pipeline, f, value) {
     input = el("input", {type: f.secret ? "password" : "text", id: inputId(pipeline, f.key)});
     input.value = value == null ? "" : value;
   }
+  // Le libellé donne le nom lisible ; la clé de config reste affichée en petit,
+  // c'est elle qu'on retrouve dans 00-config.py.
   return el("div", {class: "field"},
-    el("label", {for: input.id, text: f.label}),
-    input,
-    f.help ? el("div", {class: "help", text: f.help}) : "");
+    el("label", {for: input.id},
+      el("div", {text: f.label}),
+      el("div", {class: "key", text: f.key})),
+    el("div", {class: "value"}, input,
+      f.help ? el("div", {class: "help", text: f.help}) : ""));
 }
-const inputId = (p, k) => `cfg-${p}-${k}`;
 
 function readField(pipeline, f) {
   const node = $("#" + inputId(pipeline, f.key));
@@ -175,79 +240,83 @@ function readField(pipeline, f) {
   return node.value;
 }
 
+// « clean — nettoie les noms » → ["clean", "nettoie les noms"]
+function splitDesc(desc) {
+  const i = desc.indexOf(" — ");
+  return i === -1 ? [desc, ""] : [desc.slice(0, i), desc.slice(i + 3)];
+}
+
 async function render() {
   buildTabs();
   const p = META.pipelines[CURRENT];
   const panels = $("#panels");
   panels.innerHTML = "";
 
-  // — bloc lancement —
-  const modes = el("div", {class: "row modes"},
-    el("label", {}, radio("mode", "dry-run", true), document.createTextNode(" Simulation (dry-run)")),
-    el("label", {}, radio("mode", "real", false), document.createTextNode(" Réel")),
-  );
-  const launchPanel = el("div", {class: "panel"},
-    el("h2", {text: "Lancer"}),
-    modes,
-  );
+  // valeurs courantes (00-config.py + surcouche 00-config.local.py)
+  let values = {}, overlay = null, cfgError = null;
+  try {
+    const r = await api("GET", "/api/config/" + CURRENT);
+    values = r.values; overlay = r.overlay;
+  } catch (e) {
+    cfgError = e.message;
+  }
 
-  let stepsBox = null;
+  // Les champs portant "step" sont rendus SOUS l'étape qu'ils règlent ; les
+  // autres (dossiers, mode, webhook) vont dans la carte « Général ».
+  const byStep = {}, common = [];
+  p.fields.forEach(f => {
+    if (f.step) (byStep[f.step] = byStep[f.step] || []).push(f);
+    else common.push(f);
+  });
+
+  const gen = el("div", {class: "card"}, el("h2", {text: "Général · " + p.label}));
+  if (cfgError) gen.append(el("div", {class: "note err", text: "Erreur lecture config : " + cfgError}));
+  if (overlay) {
+    gen.append(el("div", {class: "note", text: "Surcouche active : " + overlay
+      + " — ces valeurs écrasent 00-config.py."}));
+  }
+  common.forEach(f => gen.append(fieldInput(CURRENT, f, values[f.key])));
+  panels.append(gen);
+
+  const stepsCard = el("div", {class: "card"}, el("h2", {text: "Étapes & options"}));
   if (p.steps) {
-    stepsBox = el("div", {class: "steps"});
     // [id, description] ou [id, description, cochée_par_défaut] : l'étape 03 du
     // pipeline public (identification en ligne) est décochée par défaut.
     p.steps.forEach(([id, desc, checked]) => {
-      const cb = el("input", {type: "checkbox", value: id, id: `step-${id}`});
+      const cb = el("input", {type: "checkbox", class: "switch step-cb", value: id,
+                              id: `step-${id}`});
       cb.checked = checked !== false;
-      stepsBox.append(el("label", {title: desc}, cb, document.createTextNode(" " + id + " · " + desc)));
+      const [name, rest] = splitDesc(desc);
+      const head = el("label", {class: "step-head", for: cb.id}, cb,
+        el("span", {class: "step-num", text: id}),
+        el("span", {class: "step-title", text: name},
+          rest ? el("span", {class: "step-desc", text: " — " + rest}) : ""));
+      const fields = byStep[id] || [];
+      const body = el("div", {class: "step-body"});
+      if (fields.length) fields.forEach(f => body.append(fieldInput(CURRENT, f, values[f.key])));
+      else body.append(el("div", {class: "note", text: "Aucune option propre à cette étape."}));
+      const step = el("div", {class: "step"}, head, body);
+      // Étape désactivée : ses réglages restent lisibles mais estompés.
+      const sync = () => step.classList.toggle("off", !cb.checked);
+      cb.addEventListener("change", sync);
+      sync();
+      stepsCard.append(step);
     });
-    launchPanel.append(el("div", {style: "margin-top:6px"},
-      el("div", {class: "tag", text: "Étapes :"}), stepsBox));
+  } else {
+    stepsCard.append(el("div", {class: "note", text: "Ce pipeline n'a pas d'étapes sélectionnables."}));
   }
-
-  const goBtn = el("button", {class: "act go", text: "Lancer", onclick: doRun});
-  const warn = el("span", {class: "real-warn", id: "realWarn", style: "display:none"},
-    "⚠ Mode réel : opérations destructrices (suppression d'originaux, upload).");
-  launchPanel.append(el("div", {class: "row", style: "margin-top:14px"}, goBtn, warn));
-  panels.append(launchPanel);
-
-  // — bloc config —
-  const cfgPanel = el("div", {class: "panel"}, el("h2", {text: "Configuration (" + p.label + ")"}));
-  const grid = el("div", {class: "grid"});
-  cfgPanel.append(grid);
-  const saveBtn = el("button", {class: "act save", text: "Enregistrer la config", onclick: () => saveConfig(CURRENT, p)});
-  const toast = el("span", {class: "toast", id: "cfgToast"});
-  cfgPanel.append(el("div", {class: "row", style: "margin-top:14px"}, saveBtn, toast));
-  panels.append(cfgPanel);
-
-  // valeurs courantes (00-config.py + surcouche 00-config.local.py)
-  try {
-    const {values, overlay} = await api("GET", "/api/config/" + CURRENT);
-    if (overlay) {
-      cfgPanel.insertBefore(
-        el("div", {class: "help", style: "margin-bottom:10px",
-                   text: "Surcouche active : " + overlay + " — ces valeurs écrasent 00-config.py."}),
-        grid);
-    }
-    p.fields.forEach(f => grid.append(fieldInput(CURRENT, f, values[f.key])));
-  } catch (e) {
-    grid.append(el("div", {class: "toast err", text: "Erreur lecture config : " + e.message}));
-  }
-
-  // refléter l'état courant des modes (avertissement réel)
-  document.querySelectorAll('input[name=mode]').forEach(r =>
-    r.addEventListener("change", () => {
-      $("#realWarn").style.display = pickedMode() === "real" ? "inline" : "none";
-    }));
+  panels.append(stepsCard);
   applyRunningState();
 }
 
-function radio(name, value, checked) {
-  const r = el("input", {type: "radio", name, value});
-  if (checked) r.checked = true;
-  return r;
-}
 const pickedMode = () => (document.querySelector('input[name=mode]:checked') || {}).value || "dry-run";
+
+function toast(msg, cls) {
+  const t = $("#cfgToast");
+  t.className = "note " + (cls || "");
+  t.textContent = msg;
+  if (msg) setTimeout(() => { if (t.textContent === msg) t.textContent = ""; }, 4000);
+}
 
 // ── actions ──
 async function doRun() {
@@ -255,7 +324,7 @@ async function doRun() {
   const mode = pickedMode();
   let steps = null;
   if (p.steps) {
-    steps = [...document.querySelectorAll('.steps input:checked')].map(c => c.value);
+    steps = [...document.querySelectorAll('input.step-cb:checked')].map(c => c.value);
     if (steps.length === 0) { alert("Sélectionne au moins une étape."); return; }
   }
   if (mode === "real") {
@@ -289,17 +358,16 @@ async function doStop() {
   try { await api("POST", "/api/stop"); } catch (e) { alert(e.message); }
 }
 
-async function saveConfig(pipeline, p) {
+async function saveConfig() {
+  const p = META.pipelines[CURRENT];
   const payload = {};
-  p.fields.forEach(f => payload[f.key] = readField(pipeline, f));
-  const toast = $("#cfgToast");
+  p.fields.forEach(f => payload[f.key] = readField(CURRENT, f));
   try {
-    await api("POST", "/api/config/" + pipeline, payload);
-    toast.className = "toast ok"; toast.textContent = "✓ Enregistré dans 00-config.local.py";
+    await api("POST", "/api/config/" + CURRENT, payload);
+    toast("✓ Enregistré dans 00-config.local.py", "ok");
   } catch (e) {
-    toast.className = "toast err"; toast.textContent = "✗ " + e.message;
+    toast("✗ " + e.message, "err");
   }
-  setTimeout(() => { toast.textContent = ""; }, 4000);
 }
 
 // ── logs / statut ──
@@ -339,7 +407,8 @@ function setRunning(running, meta) {
 
 function applyRunningState() {
   $("#stopBtn").disabled = !RUNNING;
-  document.querySelectorAll("button.go").forEach(b => b.disabled = RUNNING);
+  $("#goBtn").disabled = RUNNING;
+  $("#saveBtn").disabled = RUNNING;
 }
 
 async function refreshStatus() {
@@ -352,8 +421,14 @@ async function refreshStatus() {
 
 // ── init ──
 (async function init() {
+  $("#goBtn").addEventListener("click", doRun);
+  $("#saveBtn").addEventListener("click", saveConfig);
   $("#stopBtn").addEventListener("click", doStop);
   $("#clearBtn").addEventListener("click", () => { $("#console").textContent = ""; });
+  document.querySelectorAll('input[name=mode]').forEach(r =>
+    r.addEventListener("change", () => {
+      $("#realWarn").style.display = pickedMode() === "real" ? "inline" : "none";
+    }));
   META = await api("GET", "/api/meta");
   CURRENT = Object.keys(META.pipelines)[0];
   await render();

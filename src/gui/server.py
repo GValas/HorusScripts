@@ -38,12 +38,16 @@ ROOT = GUI_DIR.parent.parent  # …/HorusScripts
 # type ∈ {bool, int, float, str, str_or_none, list, choice}
 # Une étape s'écrit [id, description] ou [id, description, cochée_par_défaut].
 # Un champ marqué "secret": True s'affiche masqué (clés d'API).
+# Un champ portant "step": "03" s'affiche dans la GUI sous la case de cette
+# étape (au lieu du bloc « réglages communs ») : on voit d'un coup d'oeil ce
+# qui règle le script qu'on vient de cocher.
 # ──────────────────────────────────────────────────────────────────────────────
 PRESET_CHOICES = ["p1", "p2", "p3", "p4", "p5", "p6", "p7"]
 
 PIPELINES = {
     "perso": {
         "label": "Perso (photos/vidéos → Google Photos)",
+        "short": "Perso",
         "launcher": "run-perso-media-pipeline.sh",
         "config": "src/perso-media/00-config.py",
         "steps": [
@@ -54,16 +58,16 @@ PIPELINES = {
         ],
         "fields": [
             {
-                "key": "DRY_RUN",
-                "type": "bool",
-                "label": "Simulation par défaut (DRY_RUN)",
-                "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge.",
-            },
-            {
                 "key": "PHOTOS_SRC",
                 "type": "str",
                 "label": "Dossier source (PHOTOS_SRC)",
                 "help": "Racine scannée par 01/02/03 (NAS ou dossier Windows en /mnt/c/…).",
+            },
+            {
+                "key": "DRY_RUN",
+                "type": "bool",
+                "label": "Simulation par défaut (DRY_RUN)",
+                "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge.",
             },
             {
                 "key": "VIDEO_CQ",
@@ -79,55 +83,67 @@ PIPELINES = {
                 "help": "p1 (rapide) → p7 (qualité).",
             },
             {
-                "key": "CONVERT_SCAN_WORKERS",
-                "type": "int",
-                "label": "Threads scan ffprobe (CONVERT_SCAN_WORKERS)",
-            },
-            {
-                "key": "COMPRESS_MAX_PHOTO_SIZE",
-                "type": "int",
-                "label": "Côté max photo, px (COMPRESS_MAX_PHOTO_SIZE)",
-            },
-            {
-                "key": "COMPRESS_VIDEO_HEIGHT",
-                "type": "int",
-                "label": "Hauteur vidéo compressée, px (COMPRESS_VIDEO_HEIGHT)",
-            },
-            {
-                "key": "COMPRESS_JPEG_QUALITY",
-                "type": "int",
-                "label": "Qualité JPEG (COMPRESS_JPEG_QUALITY)",
-            },
-            {
-                "key": "COMPRESS_PHOTO_WORKERS",
-                "type": "int",
-                "label": "Threads compression photo (COMPRESS_PHOTO_WORKERS)",
-            },
-            {
-                "key": "UPLOAD_TRANSFERS",
-                "type": "int",
-                "label": "Uploads parallèles (UPLOAD_TRANSFERS)",
-            },
-            {
-                "key": "UPLOAD_TPSLIMIT",
-                "type": "int",
-                "label": "Plafond requêtes/s (UPLOAD_TPSLIMIT)",
-            },
-            {
-                "key": "UPLOAD_RETRIES",
-                "type": "int",
-                "label": "Passes rclone (UPLOAD_RETRIES)",
-            },
-            {
                 "key": "NOTIFY_WEBHOOK",
                 "type": "str_or_none",
                 "label": "Webhook de fin de run (NOTIFY_WEBHOOK)",
                 "help": "URL ntfy/webhook, ou vide pour aucune notification.",
             },
+            # ── Étape 01 : normalisation (H.265 + MKV, HEIC→JPG) ────────────────
+            {
+                "key": "CONVERT_SCAN_WORKERS",
+                "step": "01",
+                "type": "int",
+                "label": "Threads scan ffprobe (CONVERT_SCAN_WORKERS)",
+            },
+            # ── Étape 03 : copies compressées pour Google Photos ────────────────
+            {
+                "key": "COMPRESS_MAX_PHOTO_SIZE",
+                "step": "03",
+                "type": "int",
+                "label": "Côté max photo, px (COMPRESS_MAX_PHOTO_SIZE)",
+            },
+            {
+                "key": "COMPRESS_VIDEO_HEIGHT",
+                "step": "03",
+                "type": "int",
+                "label": "Hauteur vidéo compressée, px (COMPRESS_VIDEO_HEIGHT)",
+            },
+            {
+                "key": "COMPRESS_JPEG_QUALITY",
+                "step": "03",
+                "type": "int",
+                "label": "Qualité JPEG (COMPRESS_JPEG_QUALITY)",
+            },
+            {
+                "key": "COMPRESS_PHOTO_WORKERS",
+                "step": "03",
+                "type": "int",
+                "label": "Threads compression photo (COMPRESS_PHOTO_WORKERS)",
+            },
+            # ── Étape 04 : upload rclone ────────────────────────────────────────
+            {
+                "key": "UPLOAD_TRANSFERS",
+                "step": "04",
+                "type": "int",
+                "label": "Uploads parallèles (UPLOAD_TRANSFERS)",
+            },
+            {
+                "key": "UPLOAD_TPSLIMIT",
+                "step": "04",
+                "type": "int",
+                "label": "Plafond requêtes/s (UPLOAD_TPSLIMIT)",
+            },
+            {
+                "key": "UPLOAD_RETRIES",
+                "step": "04",
+                "type": "int",
+                "label": "Passes rclone (UPLOAD_RETRIES)",
+            },
         ],
     },
     "public": {
         "label": "Public (films → noms propres, HEVC, identification en ligne)",
+        "short": "Public",
         "launcher": "run-public-media-pipeline.sh",
         "config": "src/public-media/00-config.py",
         "steps": [
@@ -139,15 +155,14 @@ PIPELINES = {
                 "(OpenSubtitles + TMDB)",
                 False,
             ],
+            [
+                "04",
+                "slim-audio — allège les pistes audio lossless "
+                "(vidéo copiée, aucune perte d'image)",
+                False,
+            ],
         ],
         "fields": [
-            {
-                "key": "DRY_RUN",
-                "type": "bool",
-                "label": "Simulation par défaut (DRY_RUN)",
-                "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge. "
-                "02 SUPPRIME les originaux en mode réel.",
-            },
             {
                 "key": "NAS_MOUNT",
                 "type": "str",
@@ -161,30 +176,11 @@ PIPELINES = {
                 "help": "Un chemin par ligne (chemins absolus).",
             },
             {
-                "key": "CONVERT_CQ",
-                "type": "int",
-                "label": "Qualité NVENC (CONVERT_CQ)",
-                "help": "Plus bas = meilleure qualité (24–28 conseillé).",
-            },
-            {
-                "key": "CONVERT_PRESET",
-                "type": "choice",
-                "choices": PRESET_CHOICES,
-                "label": "Préréglage NVENC (CONVERT_PRESET)",
-                "help": "p1 (rapide) → p7 (qualité).",
-            },
-            {
-                "key": "CONVERT_MAX_RESOLUTION",
-                "type": "str_or_none",
-                "label": "Downscale max (CONVERT_MAX_RESOLUTION)",
-                "help": "480p / 720p / 1080p / 1440p / 2160p / 4k, ou vide pour aucun.",
-            },
-            {
-                "key": "CONVERT_MAX_BITRATE",
-                "type": "float",
-                "label": "Débit max, Mb/s (CONVERT_MAX_BITRATE)",
-                "help": "Ré-encode tout fichier au-dessus, même déjà en HEVC — "
-                "le seul réglage qui vise la taille. 0 = désactivé.",
+                "key": "DRY_RUN",
+                "type": "bool",
+                "label": "Simulation par défaut (DRY_RUN)",
+                "help": "Défaut du pipeline ; le mode choisi au lancement le surcharge. "
+                "02 SUPPRIME les originaux en mode réel.",
             },
             {
                 "key": "NOTIFY_WEBHOOK",
@@ -192,9 +188,41 @@ PIPELINES = {
                 "label": "Webhook de fin de run (NOTIFY_WEBHOOK)",
                 "help": "URL ntfy/webhook, ou vide pour aucune notification.",
             },
-            # ── Étape 03 : identification en ligne des films ──────────────
+            # ── Étape 02 : ré-encodage HEVC ─────────────────────────────────────
+            {
+                "key": "CONVERT_CQ",
+                "step": "02",
+                "type": "int",
+                "label": "Qualité NVENC (CONVERT_CQ)",
+                "help": "Plus bas = meilleure qualité (24–28 conseillé).",
+            },
+            {
+                "key": "CONVERT_PRESET",
+                "step": "02",
+                "type": "choice",
+                "choices": PRESET_CHOICES,
+                "label": "Préréglage NVENC (CONVERT_PRESET)",
+                "help": "p1 (rapide) → p7 (qualité).",
+            },
+            {
+                "key": "CONVERT_MAX_RESOLUTION",
+                "step": "02",
+                "type": "str_or_none",
+                "label": "Downscale max (CONVERT_MAX_RESOLUTION)",
+                "help": "480p / 720p / 1080p / 1440p / 2160p / 4k, ou vide pour aucun.",
+            },
+            {
+                "key": "CONVERT_MAX_BITRATE",
+                "step": "02",
+                "type": "float",
+                "label": "Débit max, Mb/s (CONVERT_MAX_BITRATE)",
+                "help": "Ré-encode tout fichier au-dessus, même déjà en HEVC — "
+                "le seul réglage qui vise la taille. 0 = désactivé.",
+            },
+            # ── Étape 03 : identification en ligne des films ────────────────────
             {
                 "key": "IDENTIFY_PATTERN",
+                "step": "03",
                 "type": "str",
                 "label": "Motif de renommage (IDENTIFY_PATTERN)",
                 "help": "Champs : {annee} (ou {yyyy}), {titre}, {titre_vo}, "
@@ -202,6 +230,7 @@ PIPELINES = {
             },
             {
                 "key": "IDENTIFY_FOLDERS",
+                "step": "03",
                 "type": "list",
                 "label": "Dossiers de films à identifier (IDENTIFY_FOLDERS)",
                 "help": "Un chemin par ligne. FILMS UNIQUEMENT (le motif n'a "
@@ -209,6 +238,7 @@ PIPELINES = {
             },
             {
                 "key": "IDENTIFY_OPENSUBTITLES_API_KEY",
+                "step": "03",
                 "type": "str_or_none",
                 "secret": True,
                 "label": "Clé API OpenSubtitles",
@@ -217,6 +247,7 @@ PIPELINES = {
             },
             {
                 "key": "IDENTIFY_TMDB_API_KEY",
+                "step": "03",
                 "type": "str_or_none",
                 "secret": True,
                 "label": "Clé API TMDB (v3)",
@@ -225,18 +256,21 @@ PIPELINES = {
             },
             {
                 "key": "IDENTIFY_LANGUAGE",
+                "step": "03",
                 "type": "str",
                 "label": "Langue des titres (IDENTIFY_LANGUAGE)",
                 "help": "Code TMDB, ex. fr-FR ou en-US.",
             },
             {
                 "key": "IDENTIFY_SPACE_REPLACEMENT",
+                "step": "03",
                 "type": "str_or_none",
                 "label": "Remplacement des espaces (IDENTIFY_SPACE_REPLACEMENT)",
                 "help": "« . » pour Le.Prénom ; vide pour garder les espaces.",
             },
             {
                 "key": "IDENTIFY_FALLBACK_TITLE_SEARCH",
+                "step": "03",
                 "type": "bool",
                 "label": "Repli recherche par titre (IDENTIFY_FALLBACK_TITLE_SEARCH)",
                 "help": "Indispensable après 02 : le ré-encodage change "
@@ -244,25 +278,78 @@ PIPELINES = {
             },
             {
                 "key": "IDENTIFY_RENAME_SUBTITLES",
+                "step": "03",
                 "type": "bool",
                 "label": "Renommer aussi les sous-titres (IDENTIFY_RENAME_SUBTITLES)",
             },
             {
                 "key": "IDENTIFY_RENAME_FOLDER",
+                "step": "03",
                 "type": "bool",
                 "label": "Renommer le dossier du film (IDENTIFY_RENAME_FOLDER)",
                 "help": "Seulement s'il ne contient qu'un seul film.",
             },
             {
                 "key": "IDENTIFY_REQUEST_DELAY",
+                "step": "03",
                 "type": "float",
                 "label": "Délai entre appels d'API, s (IDENTIFY_REQUEST_DELAY)",
             },
             {
                 "key": "IDENTIFY_MAX_FILES",
+                "step": "03",
                 "type": "int",
                 "label": "Films max par run (IDENTIFY_MAX_FILES)",
                 "help": "0 = illimité. Utile pour tester sans brûler le quota.",
+            },
+            # ── Étape 04 : allègement des pistes audio ──────────────────────────
+            {
+                "key": "AUDIO_FOLDERS",
+                "step": "04",
+                "type": "list",
+                "label": "Dossiers à alléger (AUDIO_FOLDERS)",
+                "help": "Un chemin par ligne. Doit être SOUS la racine NAS "
+                "montée dans le conteneur.",
+            },
+            {
+                "key": "AUDIO_MAX_BITRATE",
+                "step": "04",
+                "type": "float",
+                "label": "Débit audio max par piste, Mb/s (AUDIO_MAX_BITRATE)",
+                "help": "Au-dessus, la piste est ré-encodée. 1.0 attrape le "
+                "lossless (TrueHD, DTS-HD) sans toucher aux pistes compressées. "
+                "0 = étape désactivée.",
+            },
+            {
+                "key": "AUDIO_TARGET_CODEC",
+                "step": "04",
+                "type": "choice",
+                "choices": ["eac3", "libopus"],
+                "label": "Codec de destination (AUDIO_TARGET_CODEC)",
+                "help": "eac3 : lu partout, mais 6 canaux max (le 7.1 devient "
+                "5.1). libopus : garde le 7.1, lecteurs récents seulement.",
+            },
+            {
+                "key": "AUDIO_TARGET_BITRATE_KBPS",
+                "step": "04",
+                "type": "int",
+                "label": "Débit cible, kb/s (AUDIO_TARGET_BITRATE_KBPS)",
+            },
+            {
+                "key": "AUDIO_MAX_CHANNELS",
+                "step": "04",
+                "type": "int",
+                "label": "Canaux max en sortie (AUDIO_MAX_CHANNELS)",
+                "help": "6 pour eac3 (limite de l'encodeur), 8 pour libopus.",
+            },
+            {
+                "key": "AUDIO_DROP_DUPLICATE_LANGUAGES",
+                "step": "04",
+                "type": "bool",
+                "label": "Supprimer les doublons de langue "
+                "(AUDIO_DROP_DUPLICATE_LANGUAGES)",
+                "help": "Prudence : deux pistes d'une même langue sont souvent "
+                "deux doublages différents (VFF/VFQ), pas un doublon.",
             },
         ],
     },
@@ -599,6 +686,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 key: {
                     "label": p["label"],
                     "steps": p["steps"],
+                    "short": p.get("short", key),
                     "fields": p["fields"],
                 }
                 for key, p in PIPELINES.items()
