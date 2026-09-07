@@ -25,6 +25,10 @@ rapport.csv
 # généré par 03-identify-movies.py, non versionné
 .identify-cache.json
 **/.identify-cache.json
+
+# Cache de sondage audio (débit réel par piste) — généré par 04-slim-audio.py
+.audio-cache.json
+**/.audio-cache.json
 *.tmp
 
 # Fichiers log de conversion — générés, non versionnés
@@ -32,6 +36,8 @@ conversion.log
 dry_run.log
 **/conversion.log
 **/dry_run.log
+# …y compris les sorties redirigées à la main (gui.log, audio-run.log, etc.)
+*.log
 
 # Dossier de sortie de compress-for-gphotos.py (copies compressées)
 output/

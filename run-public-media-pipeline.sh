@@ -7,6 +7,8 @@
 #   02 convert-to-h265 : ré-encode en HEVC (NVENC) — SUPPRIME les originaux
 #   03 identify-movies : identifie les films en ligne (OpenSubtitles + TMDB) et
 #                        les renomme selon IDENTIFY_PATTERN  [HORS défaut]
+#   04 slim-audio      : allège les pistes audio lossless (vidéo copiée telle
+#                        quelle, aucune perte d'image)       [HORS défaut]
 # Défaut : 01 02. L'étape 03 est optionnelle (appels d'API externes) et ne se
 # lance que si on la demande explicitement.
 #
@@ -20,6 +22,7 @@
 #   ./run-public-media-pipeline.sh         # demande confirmation si DRY_RUN=False
 #   ./run-public-media-pipeline.sh -y      # sans confirmation
 #   ./run-public-media-pipeline.sh 03      # ne lance que cette étape
+#   ./run-public-media-pipeline.sh 04      # allègement audio seul
 #   ./run-public-media-pipeline.sh 01 02 03  # tout, identification comprise
 #   ./run-public-media-pipeline.sh --dry-run  # force la simulation (ignore 00-config)
 #   ./run-public-media-pipeline.sh --real     # force l'exécution réelle
@@ -46,8 +49,8 @@ for arg in "$@"; do
     -y|--yes) ASSUME_YES=1 ;;
     --dry-run) DRY_OVERRIDE=1 ;;
     --real) DRY_OVERRIDE=0 ;;
-    01|02|03) STEPS+=("$arg") ;;
-    *) echo "Argument inconnu : $arg (attendu: -y, --dry-run, --real, ou 01/02/03)" >&2; exit 2 ;;
+    01|02|03|04) STEPS+=("$arg") ;;
+    *) echo "Argument inconnu : $arg (attendu: -y, --dry-run, --real, ou 01/02/03/04)" >&2; exit 2 ;;
   esac
 done
 # Défaut historique : nettoyage puis conversion. 03 (identification en ligne)
@@ -61,6 +64,7 @@ for s in "${STEPS[@]}"; do
     01) script="01-clean-names.py" ;;
     02) script="02-convert-to-h265.py" ;;
     03) script="03-identify-movies.py" ;;
+    04) script="04-slim-audio.py" ;;
   esac
   CMD="${CMD:+$CMD && }python3 $script"
 done

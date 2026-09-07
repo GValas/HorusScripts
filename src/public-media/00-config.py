@@ -222,3 +222,51 @@ IDENTIFY_MISS_TTL_DAYS = 30
 # traités par run (0 = illimité) — utile pour tester sans brûler le quota.
 IDENTIFY_REQUEST_DELAY = 0.5
 IDENTIFY_MAX_FILES = 0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 04 — slim-audio  (allègement des pistes audio, étape OPTIONNELLE)
+#   Sur une bibliothèque déjà en HEVC, les pistes LOSSLESS (TrueHD Atmos,
+#   DTS-HD MA, PCM) pèsent souvent PLUS que la vidéo : jusqu'aux deux tiers du
+#   fichier. Les ré-encoder en EAC3 divise le poids par 8 sans toucher à
+#   l'image — la vidéo est copiée bit à bit, il n'y a aucune perte de qualité
+#   visuelle ni de génération d'encodage.
+#   Non lancée par défaut : `./run-public-media-pipeline.sh 04` ou la case 04
+#   de l'interface web.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Attention : ce chemin est calculé À PARTIR du NAS_MOUNT ci-dessus, au moment
+# où ce fichier est exécuté. Une surcouche qui redéfinit NAS_MOUNT (l'interface
+# web, pour traiter un dossier Windows par exemple) ne le suit donc PAS — il
+# faut éditer AUDIO_FOLDERS aussi, ce que le formulaire permet.
+AUDIO_FOLDERS = [
+    f"{NAS_MOUNT}/movies",
+]
+
+# Plafond de débit d'une piste, en Mb/s. Au-dessus, la piste est ré-encodée.
+# Repères : AC3 5.1 = 0,45 ; EAC3 7.1 = 0,90 ; DTS core = 1,5 ;
+#           DTS-HD MA = 4 à 8 ; TrueHD Atmos = 5 à 8.
+# 1.0 attrape donc tout le lossless en laissant tranquilles les pistes
+# compressées. 0 ou None = étape désactivée.
+AUDIO_MAX_BITRATE = 1.0
+
+# Codec de destination :
+#   "eac3"    — décodé par tous les téléviseurs et amplis, MAIS l'encodeur de
+#               ffmpeg ne dépasse pas 6 canaux : une piste 7.1 sera ramenée en
+#               5.1 (cf. AUDIO_MAX_CHANNELS) ;
+#   "libopus" — conserve le 7.1 et compresse mieux (0,45 Mb/s contre 0,64),
+#               mais l'Opus multicanal n'est lu que par des lecteurs récents.
+AUDIO_TARGET_CODEC = "eac3"
+AUDIO_TARGET_BITRATE_KBPS = 640  # cible 5.1/7.1 ; réduit à 112 k/canal en deçà
+AUDIO_MAX_CHANNELS = 6  # None pour ne jamais downmixer (à réserver à libopus)
+
+# Deux pistes d'une même langue sont le plus souvent DEUX DOUBLAGES DIFFÉRENTS
+# (VFF et VFQ, ou une version longue), pas un doublon. Par défaut on n'en
+# supprime aucune : on se contente d'alléger celles qui dépassent le plafond.
+AUDIO_DROP_DUPLICATE_LANGUAGES = False
+
+AUDIO_EXTENSIONS = {".mkv", ".mp4", ".m4v"}
+
+# Cache des sondages (gitignoré) : mesurer le débit réel d'une piste TrueHD
+# impose de lire le fichier, on ne le refait pas à chaque run.
+AUDIO_SCAN_CACHE = ".audio-cache.json"
+AUDIO_SCAN_WORKERS = 8

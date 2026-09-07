@@ -19,8 +19,8 @@ piexif, rclone).
 
 ## Pipeline public — `src/public-media/`
 
-Trois étapes sur les mêmes dossiers (`INPUT_FOLDERS`), **01 et 02 par défaut**,
-**03 à la demande** :
+Quatre étapes sur les mêmes dossiers (`INPUT_FOLDERS`), **01 et 02 par défaut**,
+**03 et 04 à la demande** :
 
 1. [`01-clean-names`](src/public-media/01-clean-names.py) — nettoie les noms de
    dossiers/fichiers (retire `1080p`, `x264`…, normalise casse et séparateurs, met
@@ -46,8 +46,20 @@ Trois étapes sur les mêmes dossiers (`INPUT_FOLDERS`), **01 et 02 par défaut*
    fichier ; les résultats sont mis en cache (`.identify-cache.json`) pour
    ménager les quotas.
 
+4. [`04-slim-audio`](src/public-media/04-slim-audio.py) — **allègement audio**
+   (optionnel). Sur une logithèque déjà en HEVC, les pistes **lossless**
+   (TrueHD Atmos, DTS-HD MA, PCM) pèsent souvent **plus que la vidéo** —
+   jusqu'aux deux tiers du fichier. Cette étape les ré-encode en EAC3 (ou Opus)
+   et **copie la vidéo bit à bit** : aucune perte d'image, aucune génération
+   d'encodage, quelques dizaines de secondes par film. Les langues sont
+   conservées ; les doublons ne sont supprimés que sur demande explicite
+   (`AUDIO_DROP_DUPLICATE_LANGUAGES`), deux pistes d'une même langue étant
+   souvent deux doublages différents. Le remplacement n'a lieu qu'après
+   vérification du nombre de pistes, de la durée et du gain réel.
+
 Réglages centralisés dans [`src/public-media/00-config.py`](src/public-media/00-config.py)
-(`NAS_MOUNT`, `INPUT_FOLDERS`, `DRY_RUN`, `CLEAN_*`, `CONVERT_*`, `IDENTIFY_*`),
+(`NAS_MOUNT`, `INPUT_FOLDERS`, `DRY_RUN`, `CLEAN_*`, `CONVERT_*`, `IDENTIFY_*`,
+`AUDIO_*`),
 partagés par les scripts — même principe que le pipeline perso, plus d'`env/.env`.
 Lancement :
 
@@ -55,7 +67,8 @@ Lancement :
 ./run-public-media-pipeline.sh          # 01 + 02 ; confirmation si DRY_RUN=False
 ./run-public-media-pipeline.sh -y       # sans confirmation
 ./run-public-media-pipeline.sh 03       # uniquement l'identification en ligne
-./run-public-media-pipeline.sh 01 02 03 # tout
+./run-public-media-pipeline.sh 04       # uniquement l'allègement audio
+./run-public-media-pipeline.sh 01 02 03 04  # tout
 ```
 
 > L'étape 03 exige au moins une **clé d'API TMDB** (gratuite,
@@ -272,6 +285,12 @@ par les deux scripts via `importlib` — même principe que le pipeline perso.
 | `IDENTIFY_EXTENSIONS` | `.mkv .mp4 .avi .m4v .mov` | Conteneurs considérés comme des films par 03 |
 | `IDENTIFY_CACHE` / `IDENTIFY_MISS_TTL_DAYS` | `.identify-cache.json` / `30` | Cache des identifications (les échecs sont re-tentés après ce délai) ; `None` pour désactiver |
 | `IDENTIFY_REQUEST_DELAY` / `IDENTIFY_MAX_FILES` | `0.5` / `0` | Délai entre appels d'API (s) et plafond de films par run (`0` = illimité) |
+| `AUDIO_MAX_BITRATE` | `1.0` | Débit max d'une piste audio, en **Mb/s**. Au-dessus, la piste est ré-encodée. Repères : AC3 5.1 = 0,45 ; EAC3 7.1 = 0,90 ; DTS core = 1,5 ; DTS-HD MA et TrueHD = 4 à 8. `0` = étape désactivée |
+| `AUDIO_TARGET_CODEC` | `eac3` | `eac3` (lu partout, **6 canaux max** côté encodeur ffmpeg : un 7.1 devient 5.1) ou `libopus` (garde le 7.1, lecteurs récents) |
+| `AUDIO_TARGET_BITRATE_KBPS` | `640` | Débit cible en 5.1/7.1 ; réduit à 112 k par canal en deçà |
+| `AUDIO_MAX_CHANNELS` | `6` | Downmix au-delà (limite de l'encodeur eac3). `None` = jamais |
+| `AUDIO_DROP_DUPLICATE_LANGUAGES` | `False` | Supprimer les pistes surnuméraires d'une même langue — à activer en connaissance de cause |
+| `AUDIO_SCAN_CACHE` / `AUDIO_SCAN_WORKERS` | `.audio-cache.json` / `8` | Cache des débits mesurés (TrueHD/DTS-HD ne les déclarent pas) et sondes parallèles |
 
 `NAS_MOUNT` est aussi consommé par `docker compose` pour le mapping de volume :
 le lanceur le lit dans `00-config.py` et l'exporte avant `docker compose up`.
@@ -337,12 +356,13 @@ HorusScripts/
 ├── src/
 │   ├── notify.py                   # Notification de fin de run (commune aux 2 pipelines)
 │   ├── public-media/
-│   │   ├── 00-config.py            # Réglages centralisés des 3 scripts
+│   │   ├── 00-config.py            # Réglages centralisés des 4 scripts
 │   │   ├── 00-config.local.py      # Surcouche générée par l'interface web (gitignorée)
 │   │   ├── _common.py              # Config, espace disque, cache de scan (+ lecture CLI)
 │   │   ├── 01-clean-names.py       # Renommage (avant conversion)
 │   │   ├── 02-convert-to-h265.py   # Ré-encodage NVENC HEVC
-│   │   └── 03-identify-movies.py   # Identification en ligne + renommage (optionnel)
+│   │   ├── 03-identify-movies.py   # Identification en ligne + renommage (optionnel)
+│   │   └── 04-slim-audio.py        # Allègement des pistes audio (optionnel)
 │   ├── perso-media/
 │   │   ├── 00-config.py            # Réglages centralisés des 4 étapes
 │   │   ├── 00-config.local.py      # Surcouche générée par l'interface web (gitignorée)

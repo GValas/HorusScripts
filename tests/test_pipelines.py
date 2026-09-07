@@ -10,6 +10,8 @@ ont produit des bugs silencieux :
     titre/année déduits du nom, sous-titres voisins) ;
   - le déclenchement d'un ré-encodage par le débit (un seuil mal calculé
     supprimerait des originaux pour rien) ;
+  - le plan d'allègement audio (supprimer la mauvaise piste ferait perdre une
+    langue, ou le son tout entier) ;
   - le parsing de dates et les fuseaux (une heure UTC prise pour de l'heure
     locale décale les vidéos de 1 à 2 h dans Google Photos) ;
   - les dates déduites du nom de fichier et du dossier parent ;
@@ -60,6 +62,7 @@ common_public = load_module(PUBLIC / "_common.py", "common_public")
 clean = load_module(PUBLIC / "01-clean-names.py", "clean_names")
 identify = load_module(PUBLIC / "03-identify-movies.py", "identify_movies")
 convert = load_module(PUBLIC / "02-convert-to-h265.py", "convert_h265")
+slim = load_module(PUBLIC / "04-slim-audio.py", "slim_audio")
 
 
 def _load_enrich():
@@ -166,6 +169,97 @@ class TestBitrate(unittest.TestCase):
     def test_seuil_absent_desactive_le_controle(self):
         self.assertFalse(convert.exceeds_bitrate(99 * self.GO, 60, None))
         self.assertFalse(convert.exceeds_bitrate(99 * self.GO, 60, 0))
+
+
+class TestAudioPlan(unittest.TestCase):
+    """Étape 04 : décider quoi faire de chaque piste. Une erreur ici fait
+    perdre une langue — ou tout le son — de façon irréversible."""
+
+    # Cas réel de la logithèque : VF compressée + VO lossless.
+    SKYWALKER = [
+        {"index": 0, "codec": "eac3", "channels": 8, "language": "fre",
+         "bitrate": 0.90},
+        {"index": 1, "codec": "truehd", "channels": 8, "language": "eng",
+         "bitrate": 6.22},
+    ]
+
+    def plan(self, tracks, **kw):
+        kw.setdefault("max_bitrate", 1.0)
+        kw.setdefault("drop_duplicate_languages", False)
+        kw.setdefault("max_channels", 6)
+        return slim.plan_audio_actions(tracks, **kw)
+
+    def test_lossless_reencode_langues_conservees(self):
+        actions = self.plan(self.SKYWALKER)
+        self.assertEqual([a["action"] for a in actions], ["copy", "transcode"])
+        # 7.1 -> 5.1 : l'encodeur eac3 de ffmpeg ne va pas au-delà de 6 canaux.
+        self.assertEqual(actions[1]["channels"], 6)
+        self.assertEqual(actions[1]["kbps"], 640)
+        # Aucune piste supprimée : les deux langues survivent.
+        self.assertNotIn("drop", [a["action"] for a in actions])
+
+    def test_piste_compressee_intacte(self):
+        """Une piste sous le plafond n'est jamais touchée."""
+        actions = self.plan([self.SKYWALKER[0]])
+        self.assertEqual(actions[0]["action"], "copy")
+
+    def test_debit_inconnu_ne_declenche_rien(self):
+        """Un débit non mesuré ne doit pas provoquer de ré-encodage."""
+        tracks = [{"index": 0, "codec": "dts", "channels": 6, "language": "fre",
+                   "bitrate": None}]
+        self.assertEqual(self.plan(tracks)[0]["action"], "copy")
+
+    def test_doublons_de_langue_seulement_si_demande(self):
+        """Deux pistes « fre » sont souvent deux doublages : on ne suppose pas."""
+        tracks = [
+            {"index": 0, "codec": "dts", "channels": 6, "language": "fre",
+             "bitrate": 2.05},
+            {"index": 1, "codec": "dts", "channels": 6, "language": "fre",
+             "bitrate": 2.05},
+        ]
+        actions = self.plan(tracks)
+        self.assertNotIn("drop", [a["action"] for a in actions])
+        actions = self.plan(tracks, drop_duplicate_languages=True)
+        self.assertEqual([a["action"] for a in actions].count("drop"), 1)
+
+    def test_jamais_de_film_muet(self):
+        """Un plan qui supprimerait TOUTES les pistes est annulé."""
+        tracks = [
+            {"index": 0, "codec": "ac3", "channels": 6, "language": "fre",
+             "bitrate": 0.45},
+            {"index": 1, "codec": "ac3", "channels": 6, "language": "fre",
+             "bitrate": 0.45},
+        ]
+        actions = slim.plan_audio_actions(
+            tracks, max_bitrate=1.0, drop_duplicate_languages=True, max_channels=6
+        )
+        self.assertTrue(any(a["action"] != "drop" for a in actions))
+
+    def test_debit_cible_reduit_en_stereo(self):
+        """640 kb/s pour une piste stéréo serait du gaspillage."""
+        self.assertEqual(slim.target_bitrate_kbps(6), 640)
+        self.assertEqual(slim.target_bitrate_kbps(2), 224)
+
+    def test_langues_preservees(self):
+        """Perdre une langue est irréversible ; en gagner une étiquette, non."""
+        self.assertTrue(slim.languages_preserved(["fre", "eng"], ["fre", "eng"]))
+        # Piste non étiquetée en entrée : ffmpeg pose une étiquette au remux.
+        self.assertTrue(slim.languages_preserved(["und"], ["fre"]))
+        # Une langue connue qui change ou disparaît : refusé.
+        self.assertFalse(slim.languages_preserved(["fre", "eng"], ["fre", "spa"]))
+        self.assertFalse(slim.languages_preserved(["fre", "eng"], ["fre"]))
+
+    def test_commande_copie_la_video(self):
+        """Garde-fou central : la vidéo doit être copiée, jamais ré-encodée."""
+        actions = self.plan(self.SKYWALKER)
+        cmd = slim.build_command(Path("/in.mkv"), Path("/out.mkv"), actions)
+        self.assertIn("-c:v", cmd)
+        self.assertEqual(cmd[cmd.index("-c:v") + 1], "copy")
+        self.assertNotIn("libx265", cmd)
+        self.assertNotIn("hevc_nvenc", cmd)
+        # Les sous-titres et les pièces jointes suivent.
+        self.assertIn("0:s?", cmd)
+        self.assertIn("0:t?", cmd)
 
 
 class TestScanCacheEntry(unittest.TestCase):
@@ -647,19 +741,24 @@ class TestGuiConfigWriter(unittest.TestCase):
         self.assertEqual(c({"type": "list"}, "/a\n\n  /b  \n"), ["/a", "/b"])
         self.assertEqual(c({"type": "float"}, "0.5"), 0.5)
 
-    def test_etape_optionnelle_decochee(self):
-        """L'étape 03 (identification en ligne) ne doit pas être cochée par
-        défaut : elle appelle des API externes et renomme toute la logithèque."""
+    def test_etapes_optionnelles_decochees(self):
+        """03 et 04 ne doivent pas être cochées par défaut : la première appelle
+        des API externes et renomme toute la logithèque, la seconde réécrit les
+        fichiers. Seul l'enchaînement historique 01 → 02 l'est."""
         steps = dict(
             (s[0], s[2] if len(s) > 2 else True)
             for s in self.server.PIPELINES["public"]["steps"]
         )
-        self.assertEqual(steps, {"01": True, "02": True, "03": False})
+        self.assertEqual(
+            steps, {"01": True, "02": True, "03": False, "04": False}
+        )
 
-    def test_champs_identify_editables(self):
+    def test_champs_editables(self):
         keys = {f["key"] for f in self.server.PIPELINES["public"]["fields"]}
         self.assertIn("IDENTIFY_PATTERN", keys)
         self.assertIn("IDENTIFY_TMDB_API_KEY", keys)
+        self.assertIn("AUDIO_MAX_BITRATE", keys)
+        self.assertIn("AUDIO_TARGET_CODEC", keys)
 
 
 if __name__ == "__main__":
